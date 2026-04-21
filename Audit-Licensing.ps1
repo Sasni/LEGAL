@@ -1,0 +1,742 @@
+[CmdletBinding()]
+param(
+    [switch]$AsJson
+)
+
+$ErrorActionPreference = "Stop"
+
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Warning "Ten skrypt MUSI być uruchomiony jako Administrator, aby wyniki były wiarygodne."
+    exit
+}
+
+$findings = New-Object System.Collections.Generic.List[object]
+
+function Add-Finding {
+    param(
+        [Parameter(Mandatory = $true)][string]$Id,
+        [Parameter(Mandatory = $true)][ValidateSet("Info", "Low", "Medium", "High", "Critical")][string]$Severity,
+        [Parameter(Mandatory = $true)][string]$Area,
+        [Parameter(Mandatory = $true)][string]$Evidence,
+        [Parameter(Mandatory = $true)][string]$Recommendation
+    )
+
+    $findings.Add([pscustomobject]@{
+            Id             = $Id
+            Severity       = $Severity
+            Area           = $Area
+            Evidence       = $Evidence
+            Recommendation = $Recommendation
+        })
+}
+
+function Get-RegistryValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    try {
+        $item = Get-ItemProperty -Path $Path -ErrorAction Stop
+        return $item.$Name
+    }
+    catch {
+        return $null
+    }
+}
+
+function Convert-LicenseStatus {
+    param([int]$Status)
+
+    switch ($Status) {
+        0 { "Unlicensed" }
+        1 { "Licensed" }
+        2 { "OOBGrace" }
+        3 { "OOTGrace" }
+        4 { "NonGenuineGrace" }
+        5 { "Notification" }
+        6 { "ExtendedGrace" }
+        default { "Unknown($Status)" }
+    }
+}
+
+function Get-OfficeFriendlyName {
+    param([string]$Name, [string]$Description)
+
+    # Map internal SKU tokens in the Name/Description to human-readable product names.
+    $skuMap = [ordered]@{
+        'O365BusinessPremium|O365BusinessR|BusinessPremium'          = 'Microsoft 365 Business Premium'
+        'O365Business(?!Premium)|Office365Business'                  = 'Microsoft 365 Apps for Business'
+        'O365ProPlus|O365ProPlusR|MSOfficeProfessionalPlus365'       = 'Microsoft 365 Apps for Enterprise'
+        'O365SmallBus'                                               = 'Microsoft 365 Business Basic'
+        'O365EduCloud|O365Education'                                 = 'Microsoft 365 Education'
+        'ProPlus2024|LTSC2024ProPlus'                                = 'Office LTSC Professional Plus 2024'
+        'Standard2024|LTSC2024Standard'                              = 'Office LTSC Standard 2024'
+        'ProPlus2021|LTSC2021ProPlus'                                = 'Office LTSC Professional Plus 2021'
+        'Standard2021|LTSC2021Standard'                              = 'Office LTSC Standard 2021'
+        'ProPlus2019'                                                = 'Office Professional Plus 2019'
+        'Standard2019'                                               = 'Office Standard 2019'
+        'HomeBusiness2019|Home.*Business.*2019'                      = 'Office Home & Business 2019'
+        'HomeStudent2019|Home.*Student.*2019'                        = 'Office Home & Student 2019'
+        'Professional2019'                                           = 'Office Professional 2019'
+        'ProPlus(?!201)'                                             = 'Office Professional Plus 2016'
+        'Standard(?!201)'                                            = 'Office Standard 2016'
+        'HomeBusiness(?!201)|Home.*Business'                         = 'Office Home & Business 2016'
+        'HomeStudent(?!201)|Home.*Student'                           = 'Office Home & Student 2016'
+        'Professional(?!201)'                                        = 'Office Professional 2016'
+        'OneNoteFree|OneNote.*Free'                                  = 'OneNote (Free)'
+        'OneNote'                                                    = 'OneNote'
+        'Visio.*Plan2|VisioPro'                                      = 'Visio Plan 2 / Professional'
+        'Visio.*Plan1|VisioStd'                                      = 'Visio Plan 1 / Standard'
+        'Project.*Plan5|ProjectPro'                                  = 'Project Plan 5 / Professional'
+        'Project.*Plan3|ProjectStd'                                  = 'Project Plan 3 / Standard'
+    }
+
+    $combined = "$Name $Description"
+    foreach ($pattern in $skuMap.Keys) {
+        if ($combined -match $pattern) {
+            return $skuMap[$pattern]
+        }
+    }
+
+    # Fallback: strip internal noise and return a cleaner version of the raw name.
+    $clean = $Name -replace '^Office \d+,\s*', '' -replace '_?(Grace|Subscription|Bypass|Free|Retail|Volume|R)$', '' -replace '_', ' '
+    return $clean.Trim()
+}
+
+function Get-ChannelFromDescription {
+    param([string]$Description)
+
+    if ([string]::IsNullOrWhiteSpace($Description)) { return "Unknown" }
+    if ($Description -match "RETAIL") { return "Retail" }
+    if ($Description -match "OEM") { return "OEM" }
+    if ($Description -match "MAK") { return "Volume:MAK" }
+    if ($Description -match "KMSCLIENT") { return "Volume:KMSClient" }
+    if ($Description -match "VOLUME_KMS") { return "Volume:KMS" }
+
+    return "Other"
+}
+
+function Get-RiskLevel {
+    param([System.Collections.Generic.List[object]]$InputFindings)
+
+    $criticalCount = ($InputFindings | Where-Object { $_.Severity -eq "Critical" }).Count
+    $highCount     = ($InputFindings | Where-Object { $_.Severity -eq "High" }).Count
+    $mediumCount   = ($InputFindings | Where-Object { $_.Severity -eq "Medium" }).Count
+    $lowCount      = ($InputFindings | Where-Object { $_.Severity -eq "Low" }).Count
+
+    if ($criticalCount -ge 1) { return "Critical" }
+    if ($highCount -ge 2) { return "High" }
+    if ($highCount -eq 1 -and $mediumCount -ge 1) { return "High" }
+    if ($highCount -eq 1) { return "Elevated" }
+    if ($mediumCount -ge 2) { return "Elevated" }
+    if ($mediumCount -eq 1 -or $lowCount -ge 2) { return "Moderate" }
+    if ($lowCount -ge 1) { return "Low" }
+
+    return "Minimal"
+}
+
+if (-not $AsJson) {
+    Write-Host "--- Starting licensing audit (Windows + Office) ---" -ForegroundColor Cyan
+}
+
+$windowsAppId = "55c92734-d682-4d71-983e-d6ec3f16059f"
+# Office 2013/2016/2019/2021/2024/Microsoft 365
+$officeAppId   = "0ff1ce15-a989-479d-af46-f275c6370663"
+# Office 2010 uses a different ApplicationId
+$office2010AppId = "59a52881-a989-479d-af46-f275c6370663"
+$officeIdentityPath = "HKCU:\Software\Microsoft\Office\16.0\Common\Identity"
+$officeIdentityProfilesPath = "HKCU:\Software\Microsoft\Office\16.0\Common\Identity\Identities"
+
+$allLic = @()
+try {
+    $allLic = Get-CimInstance -ClassName SoftwareLicensingProduct | Where-Object { $_.PartialProductKey }
+}
+catch {
+    Add-Finding -Id "CIM_READ_ERROR" -Severity "Medium" -Area "Licensing API" -Evidence "Cannot read SoftwareLicensingProduct: $($_.Exception.Message)" -Recommendation "Run script with Administrator rights and confirm WMI/CIM service health."
+}
+
+$windowsLic = @($allLic | Where-Object { $_.ApplicationId -eq $windowsAppId })
+$officeLic   = @($allLic | Where-Object { $_.ApplicationId -in @($officeAppId, $office2010AppId) })
+
+$winSummary = @($windowsLic | Select-Object Name, Description, PartialProductKey, LicenseStatus,
+    @{Name = "LicenseStatusText"; Expression = { Convert-LicenseStatus $_.LicenseStatus } },
+    @{Name = "Channel";           Expression = { Get-ChannelFromDescription $_.Description } })
+
+$officeSummary = @($officeLic | Select-Object Name, Description, PartialProductKey, LicenseStatus,
+    @{Name = "LicenseStatusText"; Expression = { Convert-LicenseStatus $_.LicenseStatus } },
+    @{Name = "Channel";           Expression = { Get-ChannelFromDescription $_.Description } },
+    @{Name = "FriendlyName";      Expression = { Get-OfficeFriendlyName $_.Name $_.Description } })
+
+# Detect Office installations via Uninstall registry (catches versions not in SoftwareLicensingProduct,
+# e.g. Click-to-Run without local SPP key, or older MSI installs).
+$officeInstalled = [System.Collections.Generic.List[object]]::new()
+$uninstallPaths = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+)
+foreach ($uPath in $uninstallPaths) {
+    if (-not (Test-Path $uPath)) { continue }
+    Get-ChildItem -Path $uPath -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            $p = Get-ItemProperty -Path $_.PSPath -ErrorAction Stop
+            $isOfficeProduct = $p.Publisher -match 'Microsoft' -and $p.DisplayName -match `
+                '(?i)Microsoft (365|Office|Visio|Project).*(365|2010|2013|2016|2019|2021|2024|Home|Business|Professional|Standard|Enterprise)'
+            $isUpdateOrPack  = $p.DisplayName -match `
+                '(?i)(Update|Hotfix|Security Update|Service Pack|MUI|Language Pack|Proof|Proofing Tools|\bKB\d{6,}\b)'
+            if ($isOfficeProduct -and -not $isUpdateOrPack) {
+                $officeInstalled.Add([pscustomobject]@{
+                    DisplayName    = $p.DisplayName
+                    DisplayVersion = $p.DisplayVersion
+                    Architecture   = if ($uPath -match 'WOW6432') { '32-bit' } else { '64-bit' }
+                    InstallDate    = $p.InstallDate
+                    RegistrySource = $uPath
+                })
+            }
+        } catch { }
+    }
+}
+
+$subscriptionEntries = @($officeSummary | Where-Object { $_.Description -match "TIMEBASED_SUB|SUB" -or $_.Name -match "O365|Microsoft 365|Subscription" })
+$hasOffice365SubscriptionSku = $subscriptionEntries.Count -gt 0
+
+$office365Identity = $null
+if (Test-Path -Path $officeIdentityPath) {
+    try {
+        $identity = Get-ItemProperty -Path $officeIdentityPath -ErrorAction Stop
+        $identityProfiles = @()
+
+        if (Test-Path -Path $officeIdentityProfilesPath) {
+            $profileKeys = Get-ChildItem -Path $officeIdentityProfilesPath -ErrorAction SilentlyContinue
+            foreach ($key in $profileKeys) {
+                try {
+                    $p = Get-ItemProperty -Path $key.PSPath -ErrorAction Stop
+                    $identityProfiles += [pscustomobject]@{
+                        ProfileKey      = $key.PSChildName
+                        SignInName      = $p.SignInName
+                        UserName        = $p.UserName
+                        UserEmail       = $p.UserEmail
+                        EmailAddress    = $p.EmailAddress
+                        FederatedEmail  = $p.FederatedUserEmail
+                        TenantId        = $p.TenantId
+                    }
+                }
+                catch {
+                    # Continue with other identities if one profile key cannot be read.
+                }
+            }
+        }
+
+        $rootIdentityValues = @(
+            $identity.SignInName,
+            $identity.UserEmail,
+            $identity.FederatedUserEmail,
+            $identity.UserName
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+        $profileIdentityValues = @(
+            $identityProfiles.SignInName,
+            $identityProfiles.UserEmail,
+            $identityProfiles.EmailAddress,
+            $identityProfiles.FederatedEmail,
+            $identityProfiles.UserName
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+        $allIdentityValues = @($rootIdentityValues + $profileIdentityValues | Select-Object -Unique)
+        $hasSignedInIdentity = $allIdentityValues.Count -gt 0
+
+        $identityProps = [pscustomobject]@{
+            IdentityPath        = $officeIdentityPath
+            SignInName          = $identity.SignInName
+            UserName            = $identity.UserName
+            UserEmail           = $identity.UserEmail
+            FederatedUserEmail  = $identity.FederatedUserEmail
+            TenantId            = $identity.TenantId
+            ProfileCount        = $identityProfiles.Count
+            Profiles            = $identityProfiles
+            DetectedIdentities  = $allIdentityValues
+            IsOffice365Account  = $hasSignedInIdentity
+        }
+
+        $office365Identity = $identityProps
+
+        if ($identityProps.IsOffice365Account) {
+            Add-Finding -Id "OFFICE365_IDENTITY_PRESENT" -Severity "Info" -Area "Office 365" -Evidence "User identity detected in HKCU Office identity profile." -Recommendation "Correlate with assigned Microsoft 365 license in Entra ID / M365 Admin Center."
+        }
+    }
+    catch {
+        Add-Finding -Id "OFFICE365_IDENTITY_READ_ERROR" -Severity "Low" -Area "Office 365" -Evidence "Could not read HKCU Office identity data: $($_.Exception.Message)" -Recommendation "Run in user context with loaded profile to audit Microsoft 365 sign-in state."
+    }
+}
+
+$office365Signals = [pscustomobject]@{
+    HasSubscriptionSku = $hasOffice365SubscriptionSku
+    SubscriptionSkuCount = $subscriptionEntries.Count
+    HasIdentityProfile = [bool]$office365Identity
+    HasSignedInIdentity = [bool]($office365Identity -and $office365Identity.IsOffice365Account)
+}
+
+if (-not $windowsLic) {
+    Add-Finding -Id "WINDOWS_LICENSE_NOT_FOUND" -Severity "Medium" -Area "Windows" -Evidence "No Windows licensing product with PartialProductKey found in CIM." -Recommendation "Verify OS licensing service health and inspect slmgr /dlv manually."
+}
+
+if (-not $officeLic) {
+    $officeMissingSeverity = "Low"
+    $officeMissingEvidence = "No Office licensing product with PartialProductKey found. Office may be absent or not locally key-licensed."
+    $officeMissingRecommendation = "If Office apps are used, verify Microsoft 365 user license assignment and app sign-in status."
+
+    if ($office365Identity -and $office365Identity.IsOffice365Account) {
+        $officeMissingSeverity = "Info"
+        $officeMissingEvidence = "No local Office key license found, but Microsoft 365 user identity is present in HKCU."
+        $officeMissingRecommendation = "This can be expected for subscription licensing. Confirm tenant assignment in Microsoft 365 admin portal."
+    }
+
+    Add-Finding -Id "OFFICE_LICENSE_NOT_FOUND" -Severity $officeMissingSeverity -Area "Office" -Evidence $officeMissingEvidence -Recommendation $officeMissingRecommendation
+}
+
+if ($office365Signals.HasSubscriptionSku) {
+    Add-Finding -Id "OFFICE365_SUBSCRIPTION_SKU" -Severity "Info" -Area "Office 365" -Evidence "Detected Office subscription SKU(s) in licensing data (TIMEBASED_SUB / Subscription)." -Recommendation "Verify user assignment and sign-in state in Microsoft 365 admin center."
+}
+
+if ($office365Signals.HasSubscriptionSku -and -not $office365Signals.HasSignedInIdentity) {
+    Add-Finding -Id "OFFICE365_SUB_NO_SIGNIN" -Severity "Low" -Area "Office 365" -Evidence "Subscription SKU detected but no signed-in Office identity found in current HKCU profile." -Recommendation "Confirm the script runs in the same user context that signs in to Office, or validate Shared Computer Activation setup."
+}
+
+# Do not classify GVLK as illegal by itself.
+$kmsClientWindows = @($winSummary | Where-Object { $_.Channel -eq "Volume:KMSClient" })
+$kmsClientOffice = @($officeSummary | Where-Object { $_.Channel -eq "Volume:KMSClient" -or $_.Channel -eq "Volume:KMS" })
+if ($kmsClientWindows.Count -gt 0 -or $kmsClientOffice.Count -gt 0) {
+    Add-Finding -Id "KMS_CHANNEL_PRESENT" -Severity "Info" -Area "Licensing Channel" -Evidence "Detected KMS channel products. This can be legitimate in Volume Licensing environments." -Recommendation "Validate against organization contract and KMS/ADBA deployment design."
+}
+
+# Check known Ohook indicator files.
+$indicatorFiles = @(
+    "C:\Windows\System32\sppcs.dll",
+    "C:\Windows\SysWOW64\sppcs.dll"
+)
+foreach ($file in $indicatorFiles) {
+    if (Test-Path -Path $file) {
+        Add-Finding -Id "OHOOK_FILE_PRESENT" -Severity "High" -Area "MAS Ohook" -Evidence "Suspicious file present: $file" -Recommendation "Collect file hash, inspect signer, and compare against known-good baseline."
+    }
+}
+
+# Ohook registry: MAS sets this value to suppress Office 365 license banner.
+$ohookResiliencyPath = "HKCU:\Software\Microsoft\Office\16.0\Common\Licensing\Resiliency"
+$heartbeatVal = Get-RegistryValue -Path $ohookResiliencyPath -Name "TimeOfLastHeartbeatFailure"
+if ($heartbeatVal -eq "2040-01-01T00:00:00Z") {
+    Add-Finding -Id "MAS_OHOOK_REGISTRY" -Severity "High" -Area "MAS Ohook" `
+        -Evidence "HKCU Office Resiliency registry entry TimeOfLastHeartbeatFailure='$heartbeatVal' matches known MAS Ohook suppression value." `
+        -Recommendation "Remove or correct the registry entry and reactivate Office legitimately."
+}
+
+# Online KMS (MAS): specific directory, command file and scheduled task left by MAS Online KMS method.
+$onlineKMSDir = "C:\Program Files\Activation-Renewal"
+if (Test-Path -Path $onlineKMSDir -PathType Container) {
+    Add-Finding -Id "MAS_ONLINE_KMS_DIR" -Severity "High" -Area "MAS Online KMS" `
+        -Evidence "MAS Online KMS directory present: $onlineKMSDir" `
+        -Recommendation "Remove the directory, associated scheduled tasks, and reactivate Windows/Office legitimately."
+}
+
+foreach ($kmsFile in @("Activation_task.cmd", "Info.txt")) {
+    $kmsFilePath = Join-Path $onlineKMSDir $kmsFile
+    if (Test-Path -Path $kmsFilePath) {
+        Add-Finding -Id "MAS_ONLINE_KMS_FILE" -Severity "High" -Area "MAS Online KMS" `
+            -Evidence "MAS Online KMS file present: $kmsFilePath" `
+            -Recommendation "Remove the file, associated scheduled tasks, and reactivate legitimately."
+    }
+}
+
+try {
+    $onlineKMSTask = Get-ScheduledTask -TaskName "Activation-Renewal" -ErrorAction SilentlyContinue
+    if ($onlineKMSTask) {
+        Add-Finding -Id "MAS_ONLINE_KMS_TASK" -Severity "High" -Area "MAS Online KMS" `
+            -Evidence "MAS Online KMS scheduled task found: \Activation-Renewal" `
+            -Recommendation "Delete the scheduled task and reactivate Windows/Office legitimately."
+    }
+}
+catch {
+    # Non-critical: task query failure is handled by the main scheduled task check below.
+}
+
+# Check authenticode signature of SppExtComObj.exe (legitimate file, but a tampered copy is a hard signal).
+$sppExtPath = "$env:SystemRoot\System32\SppExtComObj.exe"
+if (Test-Path -Path $sppExtPath) {
+    try {
+        $sig = Get-AuthenticodeSignature -FilePath $sppExtPath -ErrorAction Stop
+        if ($sig.Status -ne "Valid") {
+            Add-Finding -Id "SPPEXTCOMOBJ_INVALID_SIGNATURE" -Severity "High" -Area "File Indicators" `
+                -Evidence "SppExtComObj.exe signature status: $($sig.Status). Expected: Valid (Microsoft)." `
+                -Recommendation "Compare file hash against known-good baseline and investigate possible binary replacement."
+        }
+        elseif ($sig.SignerCertificate.Subject -notmatch "Microsoft") {
+            Add-Finding -Id "SPPEXTCOMOBJ_UNEXPECTED_SIGNER" -Severity "High" -Area "File Indicators" `
+                -Evidence "SppExtComObj.exe signed by unexpected publisher: $($sig.SignerCertificate.Subject)" `
+                -Recommendation "File may have been replaced. Collect hash and escalate for forensic review."
+        }
+    }
+    catch {
+        Add-Finding -Id "SPPEXTCOMOBJ_SIGNATURE_ERROR" -Severity "Low" -Area "File Indicators" `
+            -Evidence "Could not read authenticode signature of SppExtComObj.exe: $($_.Exception.Message)" `
+            -Recommendation "Verify manually using Get-AuthenticodeSignature or sigcheck."
+    }
+}
+
+# Check for KMS activator artifacts in ProgramData and common locations.
+$programDataKmsGlob = @(
+    "$env:ProgramData\KMS*",
+    "$env:ProgramData\KMSAuto*",
+    "$env:ProgramData\KMS_VL_ALL*",
+    "$env:SystemRoot\System32\SppExtComObj*" # extra renamed copies
+)
+foreach ($glob in $programDataKmsGlob) {
+    $matches = Get-Item -Path $glob -ErrorAction SilentlyContinue
+    foreach ($match in $matches) {
+        if ($match.FullName -ne $sppExtPath) {
+            Add-Finding -Id "KMS_ARTIFACT_FOUND" -Severity "High" -Area "File Indicators" `
+                -Evidence "KMS activator artifact found: $($match.FullName)" `
+                -Recommendation "Inspect contents, remove unauthorized activator files, and validate licensing state."
+        }
+    }
+}
+
+# Check IFEO hooks for Office and Windows licensing services.
+$ifeoTargets = @(
+    "osppsvc.exe",
+    "sppsvc.exe"
+)
+
+foreach ($target in $ifeoTargets) {
+    $path = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$target"
+    if (Test-Path -Path $path) {
+        $debugger = Get-RegistryValue -Path $path -Name "Debugger"
+        $verifierDlls = Get-RegistryValue -Path $path -Name "VerifierDlls"
+        $globalFlag = Get-RegistryValue -Path $path -Name "GlobalFlag"
+
+        if (-not [string]::IsNullOrWhiteSpace($debugger)) {
+            Add-Finding -Id "IFEO_DEBUGGER" -Severity "High" -Area "IFEO" -Evidence "$target has IFEO Debugger='$debugger'" -Recommendation "Investigate why process redirection is enabled for licensing service binaries."
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($verifierDlls)) {
+            $severity = "Medium"
+            if ($verifierDlls -match "sppcs\.dll") { $severity = "High" }
+            Add-Finding -Id "IFEO_VERIFIER_DLLS" -Severity $severity -Area "IFEO" -Evidence "$target has IFEO VerifierDlls='$verifierDlls'" -Recommendation "Review verifier DLL chain and remove unauthorized hooks."
+        }
+
+        if ($null -ne $globalFlag -and "$globalFlag" -ne "") {
+            Add-Finding -Id "IFEO_GLOBALFLAG" -Severity "Low" -Area "IFEO" -Evidence "$target has IFEO GlobalFlag='$globalFlag'" -Recommendation "Confirm GlobalFlag is expected by security tooling and not persistence abuse."
+        }
+    }
+}
+
+# KMS host checks (Windows + Office registry paths).
+$kmsRegChecks = @(
+    [pscustomobject]@{
+        Area = "Windows"
+        Path = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SoftwareProtectionPlatform"
+    },
+    [pscustomobject]@{
+        Area = "Office"
+        Path = "HKLM:\SOFTWARE\Microsoft\OfficeSoftwareProtectionPlatform"
+    }
+)
+
+foreach ($check in $kmsRegChecks) {
+    $kmsHost = Get-RegistryValue -Path $check.Path -Name "KeyManagementServiceName"
+    $kmsPort = Get-RegistryValue -Path $check.Path -Name "KeyManagementServicePort"
+
+    if (-not [string]::IsNullOrWhiteSpace($kmsHost)) {
+        $evidence = "$($check.Area) KMS host configured: $kmsHost"
+        if ($kmsPort) { $evidence += ":$kmsPort" }
+
+        if ($kmsHost -match "^(localhost|127\.0\.0\.1|::1|0\.0\.0\.0)$") {
+            Add-Finding -Id "KMS_LOCALHOST" -Severity "High" -Area "KMS" -Evidence $evidence -Recommendation "Validate if local host KMS is intentional. In most environments this is suspicious."
+        }
+        elseif ($kmsHost -match "kms|vlmcs") {
+            Add-Finding -Id "KMS_HOST_PRESENT" -Severity "Info" -Area "KMS" -Evidence $evidence -Recommendation "Verify this host belongs to your organization and DNS resolves correctly."
+        }
+        else {
+            Add-Finding -Id "KMS_CUSTOM_HOST" -Severity "Medium" -Area "KMS" -Evidence $evidence -Recommendation "Validate ownership of configured KMS host/IP and compare with CMDB."
+        }
+    }
+}
+
+# slmgr output can provide extra hints, but strings are locale dependent.
+try {
+    $slmgrOutput = cscript //nologo C:\Windows\System32\slmgr.vbs /dlv 2>&1 | Out-String
+
+    if ($slmgrOutput -match "2038") {
+        Add-Finding -Id "SLMGR_2038_HINT" -Severity "Medium" -Area "slmgr" -Evidence "slmgr /dlv contains year 2038 marker. Could indicate KMS38-style activation behavior." -Recommendation "Cross-check activation renewal behavior and channel with official licensing records."
+    }
+
+    if ($slmgrOutput -match "Volume_KMSCLIENT" -and $slmgrOutput -notmatch "KMS machine name") {
+        Add-Finding -Id "KMSCLIENT_NO_MACHINE_NAME" -Severity "Low" -Area "slmgr" -Evidence "KMS client channel seen but no explicit KMS machine name found in slmgr output." -Recommendation "Could be ADBA or transient state; verify activation source in domain environment."
+    }
+}
+catch {
+    Add-Finding -Id "SLMGR_READ_ERROR" -Severity "Low" -Area "slmgr" -Evidence "Unable to run slmgr /dlv: $($_.Exception.Message)" -Recommendation "Run script as Administrator to improve coverage."
+}
+
+# --- Forensic Traces: detect deleted or previously-run activator tools ---
+
+# Prefetch files survive EXE deletion and record execution time.
+# Note: MAS itself runs as .ps1/.cmd so it does NOT create prefetch entries,
+# but EXE-based companions (KMSPico, KMSAuto, AAct, AutoKMS) do.
+$prefetchPath = "$env:SystemRoot\Prefetch"
+$prefetchIndicatorRegex = '(?i)^(autokms|kmsauto|kms_?auto|kmspico|aact(64)?|heu_kms|kms_vl_all|vlmcsd|kmseldi|km_service)'
+if (Test-Path -Path $prefetchPath) {
+    try {
+        $prefetchHits = Get-ChildItem -Path $prefetchPath -Filter "*.pf" -ErrorAction Stop |
+            Where-Object { $_.BaseName -match $prefetchIndicatorRegex }
+        foreach ($pf in $prefetchHits) {
+            Add-Finding -Id "PREFETCH_ACTIVATOR" -Severity "Medium" -Area "Forensic Traces" `
+                -Evidence "Prefetch entry found (EXE was run, possibly deleted): $($pf.Name) | LastWrite: $($pf.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))" `
+                -Recommendation "This file proves the program was executed on this machine. Investigate activation history and validate current license state."
+        }
+    }
+    catch {
+        Add-Finding -Id "PREFETCH_READ_ERROR" -Severity "Low" -Area "Forensic Traces" `
+            -Evidence "Could not read Prefetch directory: $($_.Exception.Message)" `
+            -Recommendation "Verify Prefetch is enabled and script is running as Administrator."
+    }
+}
+
+# Recycle Bin: $I metadata files contain original path of deleted items (Windows Vista+).
+# Binary format (v2, Windows 10): [8 version][8 size][8 FILETIME][4 pathLen][pathLen*2 Unicode path]
+$activatorPathRegex = '(?i)(autokms|kmsauto|kmspico|kms_vl_all|aact|ohook|sppcs\.dll|activation.renewal|mas_|heu_kms|vlmcsd)'
+try {
+    $recycleBinRoot = "C:\`$Recycle.Bin"
+    $iFiles = Get-ChildItem -Path $recycleBinRoot -Recurse -Force -Filter "`$I*" -ErrorAction SilentlyContinue
+    foreach ($iFile in $iFiles) {
+        try {
+            $bytes = [System.IO.File]::ReadAllBytes($iFile.FullName)
+            if ($bytes.Length -ge 28) {
+                $version = [BitConverter]::ToInt64($bytes, 0)
+                if ($version -eq 2) {
+                    # v2: path length at offset 24 (int32), path at offset 28 (Unicode)
+                    $pathLen = [BitConverter]::ToInt32($bytes, 24)
+                    $byteCount = $pathLen * 2
+                    if ($pathLen -gt 0 -and ($byteCount + 28) -le $bytes.Length) {
+                        $originalPath = [System.Text.Encoding]::Unicode.GetString($bytes, 28, $byteCount).TrimEnd([char]0)
+                        if ($originalPath -match $activatorPathRegex) {
+                            $deletedAt = [DateTime]::FromFileTime([BitConverter]::ToInt64($bytes, 16)).ToString('yyyy-MM-dd HH:mm:ss')
+                            Add-Finding -Id "RECYCLEBIN_ACTIVATOR" -Severity "Medium" -Area "Forensic Traces" `
+                                -Evidence "Deleted activator file found in Recycle Bin: '$originalPath' | Deleted: $deletedAt" `
+                                -Recommendation "File was deleted but its presence indicates prior activator use. Validate current license state."
+                        }
+                    }
+                }
+                elseif ($version -eq 1) {
+                    # v1 (Vista/Win7): fixed 260 UTF-16 chars at offset 24
+                    if ($bytes.Length -ge 544) {
+                        $originalPath = [System.Text.Encoding]::Unicode.GetString($bytes, 24, 520).TrimEnd([char]0)
+                        if ($originalPath -match $activatorPathRegex) {
+                            $deletedAt = [DateTime]::FromFileTime([BitConverter]::ToInt64($bytes, 16)).ToString('yyyy-MM-dd HH:mm:ss')
+                            Add-Finding -Id "RECYCLEBIN_ACTIVATOR" -Severity "Medium" -Area "Forensic Traces" `
+                                -Evidence "Deleted activator file found in Recycle Bin: '$originalPath' | Deleted: $deletedAt" `
+                                -Recommendation "File was deleted but its presence indicates prior activator use. Validate current license state."
+                        }
+                    }
+                }
+            }
+        }
+        catch {
+            # Skip unreadable $I files (locked or corrupt).
+        }
+    }
+}
+catch {
+    Add-Finding -Id "RECYCLEBIN_READ_ERROR" -Severity "Low" -Area "Forensic Traces" `
+        -Evidence "Could not enumerate Recycle Bin: $($_.Exception.Message)" `
+        -Recommendation "Run as Administrator to access all user Recycle Bin entries."
+}
+
+# --- End Forensic Traces ---
+
+# Check suspicious scheduled tasks.
+try {
+    $taskIndicatorRegex = '(?i)(^|[^a-z0-9])(autokms|kmsauto|kmspico|heu_kms|vlmcs|aact|ohook|microsoft-activation-scripts|online_kms|kms_vl_all)([^a-z0-9]|$)'
+    $taskMatches = Get-ScheduledTask -ErrorAction Stop | Where-Object {
+        $_.TaskName -match $taskIndicatorRegex -or
+        $_.TaskPath -match $taskIndicatorRegex
+    }
+
+    foreach ($task in $taskMatches) {
+        Add-Finding -Id "SUSPICIOUS_TASK" -Severity "Medium" -Area "Scheduled Tasks" -Evidence "Task: $($task.TaskPath)$($task.TaskName)" -Recommendation "Inspect task actions, creator, and execution history."
+    }
+}
+catch {
+    Add-Finding -Id "TASK_QUERY_ERROR" -Severity "Low" -Area "Scheduled Tasks" -Evidence "Could not query scheduled tasks: $($_.Exception.Message)" -Recommendation "Run with elevated privileges for full task visibility."
+}
+
+# Check suspicious services by name/display/path.
+try {
+    $serviceIndicatorRegex = '(?i)(^|[^a-z0-9])(autokms|kmsauto|kmspico|heu_kms|vlmcs|aact|ohook|sppcs|microsoft-activation-scripts)([^a-z0-9]|$)'
+    $svcMatches = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object {
+        $_.Name -match $serviceIndicatorRegex -or
+        $_.DisplayName -match $serviceIndicatorRegex -or
+        $_.PathName -match $serviceIndicatorRegex
+    }
+
+    foreach ($svc in $svcMatches) {
+        Add-Finding -Id "SUSPICIOUS_SERVICE" -Severity "Medium" -Area "Services" -Evidence "Service: $($svc.Name), Path: $($svc.PathName)" -Recommendation "Validate service publisher and remove unauthorized activator services."
+    }
+}
+catch {
+    Add-Finding -Id "SERVICE_QUERY_ERROR" -Severity "Low" -Area "Services" -Evidence "Could not query services: $($_.Exception.Message)" -Recommendation "Run with elevated privileges for complete service inventory."
+}
+
+# --- Correlation Rule Engine ---
+# Runs AFTER all individual checks. Correlates multiple weak signals into
+# high-confidence findings. Does not replace granular findings, only adds to them.
+
+$foundIds = { param($id) $findings | Where-Object { $_.Id -eq $id } }
+
+# RULE 1: IFEO hook + sppcs.dll present → near-certain Ohook installation
+$ifeoHit   = $findings | Where-Object { $_.Id -in @("IFEO_DEBUGGER", "IFEO_VERIFIER_DLLS") }
+$ohookFile = $findings | Where-Object { $_.Id -eq "OHOOK_FILE_PRESENT" }
+if ($ifeoHit -and $ohookFile) {
+    Add-Finding -Id "CORR_OHOOK_COMPLETE" -Severity "Critical" -Area "Correlation" `
+        -Evidence "IFEO hook on licensing service ($($ifeoHit[0].Evidence)) combined with sppcs.dll present. Both artefacts of the same MAS Ohook method detected simultaneously." `
+        -Recommendation "High-confidence Ohook activation detected. Remove sppcs.dll, IFEO keys, and reactivate Office with a legitimate license."
+}
+
+# RULE 2: Online KMS directory + renewal task both present → active Online KMS installation
+$onlineKmsDir  = $findings | Where-Object { $_.Id -eq "MAS_ONLINE_KMS_DIR" }
+$onlineKmsTask = $findings | Where-Object { $_.Id -eq "MAS_ONLINE_KMS_TASK" }
+if ($onlineKmsDir -and $onlineKmsTask) {
+    Add-Finding -Id "CORR_ONLINE_KMS_ACTIVE" -Severity "Critical" -Area "Correlation" `
+        -Evidence "MAS Online KMS directory and renewal scheduled task both present. Activation infrastructure is complete and operational." `
+        -Recommendation "Remove C:\Program Files\Activation-Renewal directory and the Activation-Renewal scheduled task, then reactivate legitimately."
+}
+
+# RULE 3: KMS on localhost/custom host + machine is NOT domain-joined → no legitimate KMS infrastructure
+$kmsLocalhost = $findings | Where-Object { $_.Id -in @("KMS_LOCALHOST", "KMS_CUSTOM_HOST") }
+if ($kmsLocalhost) {
+    try {
+        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        $isDomainJoined = $cs.PartOfDomain
+    }
+    catch { $isDomainJoined = $false }
+
+    if (-not $isDomainJoined) {
+        Add-Finding -Id "CORR_KMS_HEADLESS" -Severity "Critical" -Area "Correlation" `
+            -Evidence "KMS host configured ($($kmsLocalhost[0].Evidence)) on a standalone (non-domain) machine. No legitimate KMS infrastructure can explain this." `
+            -Recommendation "Remove the KMS host registry entry and validate activation through official Microsoft channels."
+    }
+}
+
+# RULE 4: Forensic activator trace + current KMS anomaly → consistent picture of past+present manipulation
+$forensicTrace = $findings | Where-Object { $_.Id -in @("PREFETCH_ACTIVATOR", "RECYCLEBIN_ACTIVATOR") }
+$kmsAnomaly    = $findings | Where-Object { $_.Id -in @("KMS_LOCALHOST", "KMS_CUSTOM_HOST", "MAS_ONLINE_KMS_DIR", "MAS_ONLINE_KMS_TASK", "OHOOK_FILE_PRESENT", "MAS_OHOOK_REGISTRY") }
+if ($forensicTrace -and $kmsAnomaly) {
+    Add-Finding -Id "CORR_FORENSIC_MATCH" -Severity "Critical" -Area "Correlation" `
+        -Evidence "Forensic traces of activator execution ($($forensicTrace[0].Evidence)) correlate with active licensing anomalies. Past and present indicators are consistent." `
+        -Recommendation "Both historical execution evidence and current system state indicate unauthorized activation tooling. Full licensing remediation required."
+}
+
+# --- End Correlation Rule Engine ---
+
+$risk = Get-RiskLevel -InputFindings $findings
+
+$report = [pscustomobject]@{
+    GeneratedAtUtc  = (Get-Date).ToUniversalTime().ToString("s") + "Z"
+    ComputerName    = $env:COMPUTERNAME
+    RiskLevel       = $risk
+    WindowsLicenses = $winSummary
+    OfficeLicenses    = $officeSummary
+    OfficeInstalled   = $officeInstalled
+    Office365Signals = $office365Signals
+    Office365Identity = $office365Identity
+    Findings        = $findings
+    Disclaimer      = "This script detects anomalies and tampering indicators. It cannot provide a 100% legal determination on its own."
+}
+
+if ($AsJson) {
+    $report | ConvertTo-Json -Depth 6
+    return
+}
+
+Write-Host ""
+Write-Host "================ LICENSE AUDIT REPORT ================" -ForegroundColor White -BackgroundColor DarkBlue
+Write-Host "Timestamp (UTC): $($report.GeneratedAtUtc)"
+Write-Host "Computer: $($report.ComputerName)"
+Write-Host "Risk level: $($report.RiskLevel)"
+Write-Host ""
+
+Write-Host "Windows licensing entries:" -ForegroundColor Cyan
+if ($winSummary.Count -eq 0) {
+    Write-Host "  (none)"
+}
+else {
+    foreach ($item in $winSummary) {
+        Write-Host "  - Name: $($item.Name)"
+        Write-Host "    Channel: $($item.Channel)"
+        Write-Host "    Status: $($item.LicenseStatusText)"
+        Write-Host "    Partial key: $($item.PartialProductKey)"
+    }
+}
+
+Write-Host ""
+Write-Host "Office licensing entries (SPP):" -ForegroundColor Cyan
+if ($officeSummary.Count -eq 0) {
+    Write-Host "  (none or not licensed via local product key)"
+}
+else {
+    foreach ($item in $officeSummary) {
+        Write-Host "  - $($item.FriendlyName)" -ForegroundColor White
+        Write-Host "    Channel: $($item.Channel)"
+        Write-Host "    Status:  $($item.LicenseStatusText)"
+        Write-Host "    Partial key: $($item.PartialProductKey)"
+        Write-Host "    Raw name: $($item.Name)"
+    }
+}
+
+Write-Host ""
+Write-Host "Installed Office products (registry):" -ForegroundColor Cyan
+if ($officeInstalled.Count -eq 0) {
+    Write-Host "  (none found in Uninstall registry)"
+}
+else {
+    foreach ($item in $officeInstalled) {
+        Write-Host "  - $($item.DisplayName) v$($item.DisplayVersion) [$($item.Architecture)]"
+        if ($item.InstallDate) { Write-Host "    Installed: $($item.InstallDate)" }
+    }
+}
+
+Write-Host ""
+Write-Host "Office 365 identity (HKCU):" -ForegroundColor Cyan
+if ($null -eq $office365Identity) {
+    Write-Host "  (not found in current user profile)"
+}
+else {
+    Write-Host "  - Identity path: $($office365Identity.IdentityPath)"
+    Write-Host "    SignInName: $($office365Identity.SignInName)"
+    Write-Host "    UserName: $($office365Identity.UserName)"
+    Write-Host "    UserEmail: $($office365Identity.UserEmail)"
+    Write-Host "    FederatedUserEmail: $($office365Identity.FederatedUserEmail)"
+    Write-Host "    TenantId: $($office365Identity.TenantId)"
+    Write-Host "    IsOffice365Account: $($office365Identity.IsOffice365Account)"
+}
+
+Write-Host ""
+Write-Host "Office 365 signals:" -ForegroundColor Cyan
+Write-Host "  - HasSubscriptionSku: $($office365Signals.HasSubscriptionSku)"
+Write-Host "    SubscriptionSkuCount: $($office365Signals.SubscriptionSkuCount)"
+Write-Host "    HasIdentityProfile: $($office365Signals.HasIdentityProfile)"
+Write-Host "    HasSignedInIdentity: $($office365Signals.HasSignedInIdentity)"
+
+Write-Host ""
+Write-Host "Findings:" -ForegroundColor Yellow
+if ($findings.Count -eq 0) {
+    Write-Host "  No anomalies detected by current checks."
+}
+else {
+    foreach ($f in $findings) {
+        Write-Host "  [$($f.Severity)] [$($f.Area)] $($f.Evidence)"
+        Write-Host "     Recommendation: $($f.Recommendation)"
+    }
+}
+
+Write-Host ""
+Write-Host "Disclaimer: $($report.Disclaimer)" -ForegroundColor DarkYellow
+Write-Host "======================================================"

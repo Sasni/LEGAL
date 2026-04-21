@@ -1,0 +1,13 @@
+# Audit script outputs
+raw_output.json
+findings.txt
+
+# Generated reports
+*_report.json
+*_report.txt
+*audit*.json
+*audit*.txt
+
+# Temporary/local run artifacts
+Audit-Licensing-Temp.ps1
+*.log
