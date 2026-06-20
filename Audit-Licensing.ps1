@@ -476,6 +476,144 @@ catch {
     Add-Finding -Id "SLMGR_READ_ERROR" -Severity "Low" -Area "slmgr" -Evidence "Unable to run slmgr /dlv: $($_.Exception.Message)" -Recommendation "Run script as Administrator to improve coverage."
 }
 
+# --- HWID / TSforge Detection ---
+# HWID (Hardware ID) to najczęściej używana dziś metoda MAS do aktywacji Windows.
+# Nie zostawia plików ani zadań — jedynym śladem jest modyfikacja bazy SPP
+# (tokens.dat, data.dat, cache.dat) oraz potencjalnie pozostałość GenuineTicket.xml.
+# TSforge to nowsza metoda działająca na poziomie pamięci/sterownika jądra.
+
+$sppStorePath = "$env:SystemRoot\System32\spp\store\2.0"
+$sppStoreFiles = @()
+if (Test-Path -Path $sppStorePath) {
+    try {
+        $sppStoreFiles = @(Get-ChildItem -Path $sppStorePath -ErrorAction Stop)
+    }
+    catch {
+        Add-Finding -Id "SPP_STORE_READ_ERROR" -Severity "Low" -Area "MAS HWID" `
+            -Evidence "Nie można odczytać katalogu SPP store ($sppStorePath): $($_.Exception.Message)" `
+            -Recommendation "Uruchom jako SYSTEM dla pełnego dostępu do SPP store."
+    }
+}
+
+# Pobranie daty instalacji Windows do porównania osi czasu SPP
+$windowsInstallDate = $null
+$lastBootTime = $null
+try {
+    $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    $windowsInstallDate = $osInfo.InstallDate
+    $lastBootTime = $osInfo.LastBootUpTime
+}
+catch { }
+
+# Check 1: tokens.dat — czas modyfikacji vs data instalacji Windows
+$tokensDat = $sppStoreFiles | Where-Object { $_.Name -eq "tokens.dat" } | Select-Object -First 1
+if ($tokensDat -and $windowsInstallDate) {
+    $daysAfterInstall = [math]::Round(($tokensDat.LastWriteTime - $windowsInstallDate).TotalDays, 0)
+
+    # Jeśli tokens.dat zmodyfikowany > 90 dni po instalacji -> podejrzane
+    if ($daysAfterInstall -gt 90) {
+        Add-Finding -Id "SPP_TOKENS_MODIFIED_AFTER_INSTALL" -Severity "Medium" -Area "MAS HWID" `
+            -Evidence "tokens.dat zmodyfikowany $daysAfterInstall dni po instalacji Windows. Instalacja: $($windowsInstallDate.ToString('yyyy-MM-dd')). tokens.dat: $($tokensDat.LastWriteTime.ToString('yyyy-MM-dd HH:mm')). Aktywacja HWID nadpisuje SPP token store." `
+            -Recommendation "Zweryfikuj czy modyfikacja pokrywa się z legalną aktywacją (feature update, zmiana edycji). Jeśli nie — porównaj z dokumentacją zakupu sprzętu."
+    }
+
+    # Check 2: tokens.dat zmodyfikowany podczas trwającej sesji (bez rebootu) -> silny sygnał HWID
+    $hoursSinceTokenMod = [math]::Round(((Get-Date) - $tokensDat.LastWriteTime).TotalHours, 2)
+    if ($hoursSinceTokenMod -lt 48 -and $lastBootTime) {
+        $uptimeHours = [math]::Round(((Get-Date) - $lastBootTime).TotalHours, 2)
+        if ($uptimeHours -gt 48 -and $hoursSinceTokenMod -lt $uptimeHours) {
+            Add-Finding -Id "SPP_TOKENS_MOD_MID_SESSION" -Severity "High" -Area "MAS HWID" `
+                -Evidence "tokens.dat zmodyfikowany $hoursSinceTokenMod godzin(y) temu podczas gdy system działa od $uptimeHours godzin. Modyfikacja SPP store bez restartu to silny wskaźnik aktywacji HWID/TSforge." `
+                -Recommendation "Wymagane natychmiastowe sprawdzenie. Uruchom slmgr /dlv i porównaj ze znanym-dobrym stanem."
+        }
+    }
+}
+
+# Check 3: data.dat — również dotykany przez HWID. Synchronizacja modyfikacji z tokens.dat
+$dataDat = $sppStoreFiles | Where-Object { $_.Name -eq "data.dat" } | Select-Object -First 1
+if ($dataDat -and $tokensDat) {
+    $timeDiff = [math]::Abs(($dataDat.LastWriteTime - $tokensDat.LastWriteTime).TotalSeconds)
+    if ($timeDiff -le 5) {
+        $daysSinceMod = [math]::Round(((Get-Date) - $tokensDat.LastWriteTime).TotalDays, 0)
+        if ($daysSinceMod -lt 30) {
+            Add-Finding -Id "SPP_STORE_SYNC_MOD" -Severity "Medium" -Area "MAS HWID" `
+                -Evidence "data.dat i tokens.dat zmodyfikowane w odstępie $timeDiff sekund ($($tokensDat.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))). Synchronizowana modyfikacja SPP store jest charakterystyczna dla wstrzyknięcia biletu HWID." `
+                -Recommendation "Skoreluj czas modyfikacji ze znanymi zdarzeniami systemowymi (aktualizacje, upgrade). Zbadaj niewyjaśnione synchroniczne modyfikacje SPP."
+        }
+    }
+}
+
+# Check 4: GenuineTicket.xml — pozostałość po HWID (ClipSVC normalnie sprząta po sobie)
+$genuineTicketGlobs = @(
+    "$env:ProgramData\Microsoft\Windows\ClipSVC\GenuineTicket\GenuineTicket.xml",
+    "$env:ProgramData\Microsoft\Windows\ClipSVC\GenuineTicket\*.xml"
+)
+foreach ($gtGlob in $genuineTicketGlobs) {
+    $gtFiles = @(Get-Item -Path $gtGlob -ErrorAction SilentlyContinue)
+    foreach ($gtFile in $gtFiles) {
+        Add-Finding -Id "HWID_GENUINE_TICKET" -Severity "High" -Area "MAS HWID" `
+            -Evidence "Znaleziono pozostałość GenuineTicket.xml: $($gtFile.FullName) | LastWrite: $($gtFile.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))" `
+            -Recommendation "Ten plik jest tworzony przez aktywację HWID i nie powinien istnieć. Usuń plik i zbadaj historię aktywacji."
+    }
+}
+
+# Check 5: Wskaźniki plikowe TSforge — DLL hooki podobne do Ohook, ale dla Windows SPP
+$tsforgeIndicatorPaths = @(
+    "$env:SystemRoot\System32\sppc.dll",
+    "$env:SystemRoot\SysWOW64\sppc.dll",
+    "$env:SystemRoot\System32\sppcext.dll",
+    "$env:SystemRoot\SysWOW64\sppcext.dll"
+)
+foreach ($tsPath in $tsforgeIndicatorPaths) {
+    if (Test-Path -Path $tsPath) {
+        $suspicious = $false
+        try {
+            $tsSig = Get-AuthenticodeSignature -FilePath $tsPath -ErrorAction Stop
+            if ($tsSig.Status -ne "Valid" -or $tsSig.SignerCertificate.Subject -notmatch "Microsoft") {
+                $suspicious = $true
+            }
+        }
+        catch {
+            $suspicious = $true
+        }
+
+        if ($suspicious) {
+            Add-Finding -Id "TSFORGE_FILE_PRESENT" -Severity "High" -Area "MAS TSforge" `
+                -Evidence "Podejrzany DLL hook SPP obecny: $tsPath" `
+                -Recommendation "Zbierz hash pliku, sprawdź podpis i porównaj ze znanym-dobrym wzorcem. TSforge używa DLL hooków do obejścia walidacji SPP."
+        }
+    }
+}
+
+# Check 6: Klucz OEM w firmware vs kanał Retail — HWID daje Retail, ale może brakować klucza OEM
+try {
+    $oemKey = (Get-CimInstance -ClassName SoftwareLicensingService -ErrorAction Stop).OA3xOriginalProductKey
+}
+catch {
+    $oemKey = $null
+}
+
+$retailWinLic = @($winSummary | Where-Object { $_.Channel -eq "Retail" -and $_.LicenseStatusText -eq "Licensed" })
+if ($retailWinLic.Count -gt 0 -and [string]::IsNullOrWhiteSpace($oemKey)) {
+    Add-Finding -Id "HWID_RETAIL_NO_OEM_KEY" -Severity "Medium" -Area "MAS HWID" `
+        -Evidence "Windows pokazuje kanał Retail i status Licensed, ale nie znaleziono klucza OEM w firmware (tabela MSDM). Urządzenia konsumenckie normalnie go posiadają." `
+        -Recommendation "Jeśli to urządzenie konsumenckie (laptop/fabryczny PC), brak klucza OEM przy licencji Retail jest anomalią. Zweryfikuj źródło licencji."
+}
+
+# Check 7: cache.dat — również część SPP store, sprawdź spójność czasową
+$cacheDat = $sppStoreFiles | Where-Object { $_.Name -eq "cache.dat" } | Select-Object -First 1
+if ($cacheDat -and $tokensDat) {
+    $cacheTokenDiff = [math]::Abs(($cacheDat.LastWriteTime - $tokensDat.LastWriteTime).TotalSeconds)
+    if ($cacheTokenDiff -le 10) {
+        $daysSinceCache = [math]::Round(((Get-Date) - $cacheDat.LastWriteTime).TotalDays, 0)
+        if ($daysSinceCache -lt 30) {
+            Add-Finding -Id "SPP_CACHE_SYNC_MOD" -Severity "Medium" -Area "MAS HWID" `
+                -Evidence "cache.dat i tokens.dat zmodyfikowane w odstępie $cacheTokenDiff sekund ($($cacheDat.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))). Pełen SPP store został dotknięty w krótkim oknie czasowym." `
+                -Recommendation "Modyfikacja całego zestawu plików SPP (tokens + data + cache) w jednym momencie jest silnie podejrzana. Skoreluj z harmonogramem aktualizacji."
+        }
+    }
+}
+
 # --- Forensic Traces: detect deleted or previously-run activator tools ---
 
 # Prefetch files survive EXE deletion and record execution time.
@@ -500,54 +638,151 @@ if (Test-Path -Path $prefetchPath) {
     }
 }
 
-# Recycle Bin: $I metadata files contain original path of deleted items (Windows Vista+).
-# Binary format (v2, Windows 10): [8 version][8 size][8 FILETIME][4 pathLen][pathLen*2 Unicode path]
-$activatorPathRegex = '(?i)(autokms|kmsauto|kmspico|kms_vl_all|aact|ohook|sppcs\.dll|activation.renewal|mas_|heu_kms|vlmcsd)'
+# PowerShell event logs (4103/4104): MAS runs as .ps1/.cmd, so it leaves NO
+# Prefetch entries. But PowerShell Operational log captures executed script
+# blocks and pipeline details — surviving script file deletion.
+$psIndicatorRegex = '(?i)(Microsoft\.Activation\.Scripts|Activation-Renewal|Online_KMS|HWID_Activation|TSforge|MAS_AllInOne|\bohook\b|\bkmsauto\b|\bkmspico\b|\bheu_kms\b|\bvlmcsd\b|\bAAct\b)'
 try {
-    $recycleBinRoot = "C:\`$Recycle.Bin"
-    $iFiles = Get-ChildItem -Path $recycleBinRoot -Recurse -Force -Filter "`$I*" -ErrorAction SilentlyContinue
-    foreach ($iFile in $iFiles) {
-        try {
-            $bytes = [System.IO.File]::ReadAllBytes($iFile.FullName)
-            if ($bytes.Length -ge 28) {
-                $version = [BitConverter]::ToInt64($bytes, 0)
-                if ($version -eq 2) {
-                    # v2: path length at offset 24 (int32), path at offset 28 (Unicode)
-                    $pathLen = [BitConverter]::ToInt32($bytes, 24)
-                    $byteCount = $pathLen * 2
-                    if ($pathLen -gt 0 -and ($byteCount + 28) -le $bytes.Length) {
-                        $originalPath = [System.Text.Encoding]::Unicode.GetString($bytes, 28, $byteCount).TrimEnd([char]0)
-                        if ($originalPath -match $activatorPathRegex) {
-                            $deletedAt = [DateTime]::FromFileTime([BitConverter]::ToInt64($bytes, 16)).ToString('yyyy-MM-dd HH:mm:ss')
-                            Add-Finding -Id "RECYCLEBIN_ACTIVATOR" -Severity "Medium" -Area "Forensic Traces" `
-                                -Evidence "Deleted activator file found in Recycle Bin: '$originalPath' | Deleted: $deletedAt" `
-                                -Recommendation "File was deleted but its presence indicates prior activator use. Validate current license state."
-                        }
-                    }
-                }
-                elseif ($version -eq 1) {
-                    # v1 (Vista/Win7): fixed 260 UTF-16 chars at offset 24
-                    if ($bytes.Length -ge 544) {
-                        $originalPath = [System.Text.Encoding]::Unicode.GetString($bytes, 24, 520).TrimEnd([char]0)
-                        if ($originalPath -match $activatorPathRegex) {
-                            $deletedAt = [DateTime]::FromFileTime([BitConverter]::ToInt64($bytes, 16)).ToString('yyyy-MM-dd HH:mm:ss')
-                            Add-Finding -Id "RECYCLEBIN_ACTIVATOR" -Severity "Medium" -Area "Forensic Traces" `
-                                -Evidence "Deleted activator file found in Recycle Bin: '$originalPath' | Deleted: $deletedAt" `
-                                -Recommendation "File was deleted but its presence indicates prior activator use. Validate current license state."
-                        }
-                    }
-                }
-            }
-        }
-        catch {
-            # Skip unreadable $I files (locked or corrupt).
+    $psOpLog = "Microsoft-Windows-PowerShell/Operational"
+    if (Get-WinEvent -ListLog $psOpLog -ErrorAction SilentlyContinue) {
+        $psEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = $psOpLog
+            ID        = 4103, 4104
+            StartTime = (Get-Date).AddDays(-90)
+        } -MaxEvents 5000 -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match $psIndicatorRegex }
+
+        foreach ($evt in $psEvents) {
+            # Extract a snippet around the match for human-readable evidence
+            $matchMatch = [regex]::Match($evt.Message, $psIndicatorRegex)
+            $ctxStart = [Math]::Max(0, $matchMatch.Index - 80)
+            $ctxLen   = [Math]::Min(240, $evt.Message.Length - $ctxStart)
+            $snippet  = ($evt.Message.Substring($ctxStart, $ctxLen) -replace '\s+', ' ').Trim()
+
+            Add-Finding -Id "POWERSHELL_LOG_ACTIVATOR" -Severity "High" -Area "Forensic Traces" `
+                -Evidence "PowerShell event ID $($evt.Id) contains activator keyword. TimeCreated: $($evt.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | Context: ...$snippet..." `
+                -Recommendation "PowerShell operational log captured MAS/activator script execution. Correlate timestamp with activation events and user session activity."
         }
     }
 }
 catch {
-    Add-Finding -Id "RECYCLEBIN_READ_ERROR" -Severity "Low" -Area "Forensic Traces" `
-        -Evidence "Could not enumerate Recycle Bin: $($_.Exception.Message)" `
-        -Recommendation "Run as Administrator to access all user Recycle Bin entries."
+    Add-Finding -Id "POWERSHELL_LOG_READ_ERROR" -Severity "Low" -Area "Forensic Traces" `
+        -Evidence "Could not query PowerShell Operational log: $($_.Exception.Message)" `
+        -Recommendation "Verify the PowerShell Operational log is enabled and the script runs as Administrator."
+}
+
+# Recycle Bin: $I metadata files contain original path of deleted items (Windows Vista+).
+# Binary format (v2, Windows 10): [8 version][8 size][8 FILETIME][4 pathLen][pathLen*2 Unicode path]
+# Checked on ALL fixed drives (not just C:), since users may have deleted activator files from any volume.
+# LIMITATION: Shift+Delete bypasses Recycle Bin entirely. For those cases, the Security
+# event log (Event ID 4660) and VSS shadow copies are checked below.
+$activatorPathRegex = '(?i)(autokms|kmsauto|kmspico|kms_vl_all|aact|ohook|sppcs\.dll|activation.renewal|mas_|heu_kms|vlmcsd)'
+
+# Enumerate all fixed drives (type 3) for Recycle Bin search.
+$fixedDrives = @(Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction SilentlyContinue | Where-Object { $_.DriveType -eq 3 })
+if (-not $fixedDrives) { $fixedDrives = @([pscustomobject]@{ DeviceID = "C:" }) }
+
+foreach ($drive in $fixedDrives) {
+    $recycleBinRoot = "$($drive.DeviceID)\`$Recycle.Bin"
+    if (-not (Test-Path -Path $recycleBinRoot)) { continue }
+
+    try {
+        $iFiles = Get-ChildItem -Path $recycleBinRoot -Recurse -Force -Filter "`$I*" -ErrorAction SilentlyContinue
+        foreach ($iFile in $iFiles) {
+            try {
+                $bytes = [System.IO.File]::ReadAllBytes($iFile.FullName)
+                if ($bytes.Length -ge 28) {
+                    $version = [BitConverter]::ToInt64($bytes, 0)
+                    if ($version -eq 2) {
+                        # v2 (Win8+): path length at offset 24 (int32), path at offset 28 (Unicode)
+                        $pathLen = [BitConverter]::ToInt32($bytes, 24)
+                        $byteCount = $pathLen * 2
+                        if ($pathLen -gt 0 -and ($byteCount + 28) -le $bytes.Length) {
+                            $originalPath = [System.Text.Encoding]::Unicode.GetString($bytes, 28, $byteCount).TrimEnd([char]0)
+                            if ($originalPath -match $activatorPathRegex) {
+                                $deletedAt = [DateTime]::FromFileTime([BitConverter]::ToInt64($bytes, 16)).ToString('yyyy-MM-dd HH:mm:ss')
+                                Add-Finding -Id "RECYCLEBIN_ACTIVATOR" -Severity "Medium" -Area "Forensic Traces" `
+                                    -Evidence "Deleted activator file found in Recycle Bin ($($drive.DeviceID)): '$originalPath' | Deleted: $deletedAt" `
+                                    -Recommendation "File was deleted but its presence indicates prior activator use. Validate current license state."
+                            }
+                        }
+                    }
+                    elseif ($version -eq 1) {
+                        # v1 (Vista/Win7): fixed 260 UTF-16 chars at offset 24
+                        if ($bytes.Length -ge 544) {
+                            $originalPath = [System.Text.Encoding]::Unicode.GetString($bytes, 24, 520).TrimEnd([char]0)
+                            if ($originalPath -match $activatorPathRegex) {
+                                $deletedAt = [DateTime]::FromFileTime([BitConverter]::ToInt64($bytes, 16)).ToString('yyyy-MM-dd HH:mm:ss')
+                                Add-Finding -Id "RECYCLEBIN_ACTIVATOR" -Severity "Medium" -Area "Forensic Traces" `
+                                    -Evidence "Deleted activator file found in Recycle Bin ($($drive.DeviceID)): '$originalPath' | Deleted: $deletedAt" `
+                                    -Recommendation "File was deleted but its presence indicates prior activator use. Validate current license state."
+                            }
+                        }
+                    }
+                }
+            }
+            catch {
+                # Skip unreadable $I files (locked or corrupt).
+            }
+        }
+    }
+    catch {
+        Add-Finding -Id "RECYCLEBIN_READ_ERROR" -Severity "Low" -Area "Forensic Traces" `
+            -Evidence "Could not enumerate Recycle Bin on $($drive.DeviceID): $($_.Exception.Message)" `
+            -Recommendation "Run as Administrator to access all user Recycle Bin entries across all drives."
+    }
+}
+
+# Security event log: if file audit policy is enabled, Event ID 4660 records
+# file deletions INCLUDING Shift+Delete (which bypasses Recycle Bin entirely).
+# Requires "Audit File System" or "Audit Object Access" in Local Security Policy
+# (secpol.msc) — NOT enabled by default on client SKUs.
+try {
+    $secLogName = "Security"
+    if (Get-WinEvent -ListLog $secLogName -ErrorAction SilentlyContinue) {
+        $secDelEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = $secLogName
+            ID        = 4660
+            StartTime = (Get-Date).AddDays(-90)
+        } -MaxEvents 2000 -ErrorAction SilentlyContinue
+
+        foreach ($evt in $secDelEvents) {
+            try {
+                $xml = [xml]$evt.ToXml()
+                [array]$nsData = $xml.Event.EventData.Data
+                $objectName = ($nsData | Where-Object { $_.Name -eq "ObjectName" }).'#text'
+                if ($objectName -and $objectName -match $activatorPathRegex) {
+                    Add-Finding -Id "SECLOG_DELETION_AUDIT" -Severity "High" -Area "Forensic Traces" `
+                        -Evidence "Security audit Event ID 4660 — activator file permanently deleted (Shift+Delete / direct erase): '$objectName' | TimeCreated: $($evt.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))" `
+                        -Recommendation "Audit policy captured permanent deletion of activator file (bypassed Recycle Bin). Correlate deletion timestamp with user session activity."
+                }
+            }
+            catch {
+                # Skip unparseable events.
+            }
+        }
+    }
+}
+catch {
+    # Security log may be inaccessible even as Administrator (requires SeSecurityPrivilege).
+    # Expected on most consumer machines — not an error worth surfacing.
+}
+
+# VSS (Volume Shadow Copy): system restore points and backup snapshots preserve
+# file history, including files later permanently deleted (Shift+Delete) or
+# emptied from Recycle Bin. Deep forensic analysis can recover them.
+try {
+    $vssCopies = @(Get-CimInstance -ClassName Win32_ShadowCopy -ErrorAction Stop)
+    if ($vssCopies.Count -gt 0) {
+        $oldestVss = ($vssCopies | Sort-Object InstallDate | Select-Object -First 1).InstallDate
+        $newestVss = ($vssCopies | Sort-Object InstallDate | Select-Object -Last 1).InstallDate
+        Add-Finding -Id "VSS_SHADOW_COPIES_PRESENT" -Severity "Info" -Area "Forensic Traces" `
+            -Evidence "$($vssCopies.Count) Volume Shadow Copy snapshot(s) found spanning $($oldestVss.ToString('yyyy-MM-dd')) to $($newestVss.ToString('yyyy-MM-dd')). Snapshots may preserve deleted activator files predating Recycle Bin cleanup or permanent erasure." `
+            -Recommendation "Mount shadow copies with 'mklink /D' or forensic tools (KAPE, Arsenal Image Mounter) to search for activator artifacts in historical file system snapshots."
+    }
+}
+catch {
+    # VSS may be disabled or inaccessible. Not an error — just no shadow copies to check.
 }
 
 # --- End Forensic Traces ---
@@ -626,12 +861,49 @@ if ($kmsLocalhost) {
 }
 
 # RULE 4: Forensic activator trace + current KMS anomaly → consistent picture of past+present manipulation
-$forensicTrace = $findings | Where-Object { $_.Id -in @("PREFETCH_ACTIVATOR", "RECYCLEBIN_ACTIVATOR") }
+$forensicTrace = $findings | Where-Object { $_.Id -in @("PREFETCH_ACTIVATOR", "RECYCLEBIN_ACTIVATOR", "POWERSHELL_LOG_ACTIVATOR", "SECLOG_DELETION_AUDIT") }
 $kmsAnomaly    = $findings | Where-Object { $_.Id -in @("KMS_LOCALHOST", "KMS_CUSTOM_HOST", "MAS_ONLINE_KMS_DIR", "MAS_ONLINE_KMS_TASK", "OHOOK_FILE_PRESENT", "MAS_OHOOK_REGISTRY") }
 if ($forensicTrace -and $kmsAnomaly) {
     Add-Finding -Id "CORR_FORENSIC_MATCH" -Severity "Critical" -Area "Correlation" `
         -Evidence "Forensic traces of activator execution ($($forensicTrace[0].Evidence)) correlate with active licensing anomalies. Past and present indicators are consistent." `
         -Recommendation "Both historical execution evidence and current system state indicate unauthorized activation tooling. Full licensing remediation required."
+}
+
+# RULE 5: GenuineTicket.xml found → hard signal of HWID activation
+# ClipSVC normally cleans up GenuineTicket.xml after processing. A leftover
+# means the ticket was injected manually (HWID method) or cleanup failed.
+$genuineTicketFinding = $findings | Where-Object { $_.Id -eq "HWID_GENUINE_TICKET" }
+if ($genuineTicketFinding) {
+    Add-Finding -Id "CORR_HWID_GENUINE_TICKET" -Severity "Critical" -Area "Correlation" `
+        -Evidence "GenuineTicket.xml remnant found: $($genuineTicketFinding.Evidence). This file is a direct artefact of ClipSVC ticket injection used by HWID activation." `
+        -Recommendation "Near-certain HWID activation detected. Remove the ticket file and investigate activation history."
+}
+
+# RULE 6: SPP tokens modified mid-session + Retail channel without OEM key → HWID activation
+# Two independent HWID signals: (1) SPP store touched during uptime without reboot,
+# (2) Retail-licensed Windows on a machine with no OEM firmware key.
+$sppMidSession = $findings | Where-Object { $_.Id -eq "SPP_TOKENS_MOD_MID_SESSION" }
+$retailNoOem  = $findings | Where-Object { $_.Id -eq "HWID_RETAIL_NO_OEM_KEY" }
+if ($sppMidSession -and $retailNoOem) {
+    Add-Finding -Id "CORR_HWID_SPP_AND_RETAIL" -Severity "Critical" -Area "Correlation" `
+        -Evidence "SPP token store modified mid-session ($($sppMidSession.Evidence)) combined with Retail channel and no OEM key ($($retailNoOem.Evidence)). Both signals independently point to HWID activation." `
+        -Recommendation "High-confidence HWID activation detected. Remove unauthorized activation and acquire legitimate Windows license."
+}
+
+# RULE 7: SPP store modification + forensic traces of activator → consistent picture
+$sppModFinding = $findings | Where-Object { $_.Id -in @("SPP_TOKENS_MOD_MID_SESSION", "SPP_STORE_SYNC_MOD", "SPP_TOKENS_MODIFIED_AFTER_INSTALL", "SPP_CACHE_SYNC_MOD") }
+if ($forensicTrace -and $sppModFinding) {
+    Add-Finding -Id "CORR_HWID_FORENSIC_MATCH" -Severity "Critical" -Area "Correlation" `
+        -Evidence "Forensic traces of activator execution ($($forensicTrace[0].Evidence)) combined with SPP store modification ($($sppModFinding[0].Evidence)). Both historical and current indicators confirm unauthorized activation." `
+        -Recommendation "Past and present evidence both point to HWID/TSforge activation. Full licensing remediation required."
+}
+
+# RULE 8: TSforge DLL + any SPP modification → active TSforge installation
+$tsforgeFileFinding = $findings | Where-Object { $_.Id -eq "TSFORGE_FILE_PRESENT" }
+if ($tsforgeFileFinding -and $sppModFinding) {
+    Add-Finding -Id "CORR_TSFORGE_ACTIVE" -Severity "Critical" -Area "Correlation" `
+        -Evidence "TSforge hook DLL present ($($tsforgeFileFinding.Evidence)) combined with SPP store modification ($($sppModFinding[0].Evidence)). Both artefacts of TSforge activation detected simultaneously." `
+        -Recommendation "High-confidence TSforge activation detected. Remove hook DLLs and SPP modifications, then reactivate Windows legitimately."
 }
 
 # --- End Correlation Rule Engine ---
