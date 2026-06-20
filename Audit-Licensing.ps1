@@ -189,12 +189,12 @@ $officeIdentityProfilesPath = "HKCU:\Software\Microsoft\Office\16.0\Common\Ident
 
 $allLic = @()
 try {
-    # WQL z filtrem ApplicationId po stronie serwera CIM — unika pobierania
-    # setek wpisów SPP (każdy komponent systemu) i wymuszania na usłudze SPP
-    # przeliczania stanu licencji dla niepotrzebnych komponentów.
-    # Bez filtru zapytanie może trwać 30-120s na starszych maszynach.
-    $licenseQuery = "SELECT * FROM SoftwareLicensingProduct WHERE ApplicationId = '$windowsAppId' OR ApplicationId = '$officeAppId' OR ApplicationId = '$office2010AppId'"
-    $allLic = Get-CimInstance -Query $licenseQuery -ErrorAction Stop | Where-Object { $_.PartialProductKey }
+    # WQL z podwójnym filtrem po stronie serwera CIM:
+    # 1) ApplicationId — tylko Windows/Office, nie setki komponentów
+    # 2) PartialProductKey IS NOT NULL — tylko aktywne licencje z kluczem
+    # Bez filtrów zapytanie może trwać 30-120s na starszych maszynach.
+    $licenseQuery = "SELECT * FROM SoftwareLicensingProduct WHERE (ApplicationId = '$windowsAppId' OR ApplicationId = '$officeAppId' OR ApplicationId = '$office2010AppId') AND PartialProductKey IS NOT NULL"
+    $allLic = @(Get-CimInstance -Query $licenseQuery -ErrorAction Stop)
 }
 catch {
     Add-Finding -Id "CIM_READ_ERROR" -Severity "Medium" -Area "Licensing API" -Evidence "Cannot read SoftwareLicensingProduct: $($_.Exception.Message)" -Recommendation "Run script with Administrator rights and confirm WMI/CIM service health."
@@ -569,6 +569,16 @@ foreach ($check in $kmsRegChecks) {
         else {
             Add-Finding -Id "KMS_CUSTOM_HOST" -Severity "Medium" -Area "KMS" -Evidence $evidence -Recommendation "Validate ownership of configured KMS host/IP and compare with CMDB."
         }
+    }
+
+    # Sprawdzenie niestandardowego portu nasłuchiwania KMS (domyślnie 1688 TCP).
+    # KMS emulatory często używają alternatywnych portów by uniknąć konfliktu
+    # z legalnym KMS lub by ukryć się przed skanerami sieciowymi.
+    $kmsListeningPort = Get-RegistryValue -Path $check.Path -Name "KeyManagementServiceListeningPort"
+    if ($kmsListeningPort -and [int]$kmsListeningPort -ne 1688) {
+        Add-Finding -Id "KMS_NONSTANDARD_PORT" -Severity "High" -Area "KMS" `
+            -Evidence "$($check.Area) KMS nasłuchuje na porcie $kmsListeningPort (standardowo 1688). Niestandardowy port to silny wskaźnik emulatora KMS." `
+            -Recommendation "Sprawdź proces nasłuchujący na porcie $kmsListeningPort (netstat -ano). Jeśli to nieautoryzowany emulator KMS — zatrzymaj i usuń."
     }
 }
 
@@ -1156,7 +1166,39 @@ try {
     }
 
     foreach ($task in $taskMatches) {
-        Add-Finding -Id "SUSPICIOUS_TASK" -Severity "Medium" -Area "Scheduled Tasks" -Evidence "Task: $($task.TaskPath)$($task.TaskName)" -Recommendation "Inspect task actions, creator, and execution history."
+        Add-Finding -Id "SUSPICIOUS_TASK" -Severity "Medium" -Area "Scheduled Tasks" -Evidence "Task: $($task.TaskPath)$($task.TaskName) (nazwa pasuje do wzorca aktywatora)" -Recommendation "Inspect task actions, creator, and execution history."
+    }
+
+    # Behawioralna analiza zadań: szukaj PowerShell z -WindowStyle Hidden,
+    # -ExecutionPolicy Bypass, -EncodedCommand (Base64) — wzorzec używany
+    # przez MAS Online KMS i większość aktywatorów PowerShell.
+    # Analizuje .Actions.Execute i .Actions.Arguments, nie tylko nazwę zadania.
+    $behavioralTaskRegex = '(?i)(-WindowStyle\s+Hidden|-ExecutionPolicy\s+Bypass|-EncodedCommand\s+\S{10,}|Activation-Renewal|\\MAS\\|\bohook\b|\bHWID\b|\bTSforge\b|\bslmgr\b\s|/ipk\b|/upk\b|Massgravel|MicrosoftActivationScripts)'
+    $allTasks = Get-ScheduledTask -ErrorAction Stop
+    foreach ($task in $allTasks) {
+        try {
+            $taskActions = $task.Actions
+            $suspiciousAction = $false
+            $actionDetail = ""
+            foreach ($action in $taskActions) {
+                $actionText = "$($action.Execute) $($action.Arguments)"
+                if ($actionText -match $behavioralTaskRegex) {
+                    $suspiciousAction = $true
+                    $actionDetail = ($actionText -replace '\s+', ' ').Trim()
+                    break
+                }
+            }
+            if ($suspiciousAction) {
+                # Sprawdź czy zadanie nie zostało już złapane przez nazwę
+                $alreadyFound = $taskMatches | Where-Object { $_.TaskName -eq $task.TaskName -and $_.TaskPath -eq $task.TaskPath }
+                if (-not $alreadyFound) {
+                    Add-Finding -Id "SUSPICIOUS_TASK_BEHAVIOR" -Severity "High" -Area "Scheduled Tasks" `
+                        -Evidence "Zadanie '$($task.TaskPath)$($task.TaskName)' ma podejrzane zachowanie: $actionDetail" `
+                        -Recommendation "Zadanie uruchamia PowerShell z flagami typowymi dla aktywatorów (-Hidden, -Bypass, -EncodedCommand). Sprawdź akcję zadania i historię wykonania."
+                }
+            }
+        }
+        catch { Write-Debug "Task action check failed for $($task.TaskName): $($_.Exception.Message)" }
     }
 }
 catch {
