@@ -140,6 +140,45 @@ if (-not $AsJson) {
     Write-Host "--- Starting licensing audit (Windows + Office) ---" -ForegroundColor Cyan
 }
 
+# --- Kontekst użytkownika: wykrycie SYSTEM vs zalogowany użytkownik ---
+# Skrypt wymaga Administratora, ale checki Office identity i vNext używają
+# HKCU i %LOCALAPPDATA%. Gdy uruchomiony jako SYSTEM (RMM, SCCM, Intune),
+# HKCU wskazuje na rejestr SYSTEM, a nie zalogowanego użytkownika!
+$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$isRunningAsSystem = $currentUser -eq "NT AUTHORITY\SYSTEM"
+
+# Znajdź interaktywnego użytkownika przez explorer.exe (zawsze w sesji usera)
+$interactiveUserName = $null
+$interactiveUserProfile = $null
+try {
+    $explorerProc = Get-Process explorer -IncludeUserName -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($explorerProc -and $explorerProc.UserName) {
+        $interactiveUserName = $explorerProc.UserName
+        $samName = ($interactiveUserName -split '\\')[-1]
+        $wmiUser = Get-CimInstance Win32_UserAccount -Filter "Name = '$samName'" -ErrorAction Stop |
+            Select-Object -First 1
+        if ($wmiUser -and $wmiUser.SID) {
+            $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($wmiUser.SID)"
+            $interactiveUserProfile = Get-ItemProperty -Path $profileKey -Name "ProfileImagePath" -ErrorAction SilentlyContinue |
+                Select-Object -ExpandProperty ProfileImagePath
+        }
+    }
+}
+catch { }
+
+if ($isRunningAsSystem) {
+    if ($interactiveUserProfile) {
+        Write-Host "  [i] Running as SYSTEM. Targeting $interactiveUserName profile for user checks." -ForegroundColor DarkYellow
+    }
+    else {
+        Write-Host "  [!] Running as SYSTEM, no interactive user detected. HKCU checks will likely be empty." -ForegroundColor Yellow
+        Add-Finding -Id "RUNNING_AS_SYSTEM_NO_USER" -Severity "Medium" -Area "System" `
+            -Evidence "Skrypt uruchomiony jako SYSTEM i nie wykryto aktywnego interaktywnego użytkownika. HKCU to rejestr SYSTEM, a nie użytkownika Office." `
+            -Recommendation "Uruchom skrypt w kontekście zalogowanego użytkownika (RMM: opcja /user), aby sprawdzić tożsamość Office 365 i tokeny vNext."
+    }
+}
+
 $windowsAppId = "55c92734-d682-4d71-983e-d6ec3f16059f"
 # Office 2013/2016/2019/2021/2024/Microsoft 365
 $officeAppId   = "0ff1ce15-a989-479d-af46-f275c6370663"
@@ -214,8 +253,13 @@ $hasTraditionalOffice = $traditionalProducts.Count -gt 0
 
 # vNext licensing: M365 Apps używają tokenów użytkownika zamiast lokalnych kluczy SPP.
 # Pliki .auth w %LOCALAPPDATA%\Microsoft\Office\16.0\Licensing potwierdzają aktywację.
+# Gdy SYSTEM: używamy profilu interaktywnego użytkownika zamiast C:\Windows\System32\config\systemprofile.
 $hasVNextTokens = $false
-$vNextLicensePath = "$env:LOCALAPPDATA\Microsoft\Office\16.0\Licensing"
+$vNextLicensePath = if ($isRunningAsSystem -and $interactiveUserProfile) {
+    "$interactiveUserProfile\AppData\Local\Microsoft\Office\16.0\Licensing"
+} else {
+    "$env:LOCALAPPDATA\Microsoft\Office\16.0\Licensing"
+}
 if (Test-Path -Path $vNextLicensePath) {
     try {
         $authFiles = Get-ChildItem -Path $vNextLicensePath -Filter "*.auth" -ErrorAction Stop
@@ -289,11 +333,17 @@ if (Test-Path -Path $officeIdentityPath) {
         $office365Identity = $identityProps
 
         if ($identityProps.IsOffice365Account) {
-            Add-Finding -Id "OFFICE365_IDENTITY_PRESENT" -Severity "Info" -Area "Office 365" -Evidence "User identity detected in HKCU Office identity profile." -Recommendation "Correlate with assigned Microsoft 365 license in Entra ID / M365 Admin Center."
+            $identityCtxNote = if ($isRunningAsSystem) { " (UWAGA: odczytane z HKCU SYSTEM, nie użytkownika. Jeśli to konto SYSTEM ma identity Office — anomalia.)" } else { "" }
+            Add-Finding -Id "OFFICE365_IDENTITY_PRESENT" -Severity "Info" -Area "Office 365" `
+                -Evidence "User identity detected in HKCU Office identity profile.$identityCtxNote" `
+                -Recommendation "Correlate with assigned Microsoft 365 license in Entra ID / M365 Admin Center."
         }
     }
     catch {
-        Add-Finding -Id "OFFICE365_IDENTITY_READ_ERROR" -Severity "Low" -Area "Office 365" -Evidence "Could not read HKCU Office identity data: $($_.Exception.Message)" -Recommendation "Run in user context with loaded profile to audit Microsoft 365 sign-in state."
+        $hkcErrorCtx = if ($isRunningAsSystem) { " (skrypt jako SYSTEM — HKCU to rejestr SYSTEM, nie użytkownika)" } else { "" }
+        Add-Finding -Id "OFFICE365_IDENTITY_READ_ERROR" -Severity "Low" -Area "Office 365" `
+            -Evidence "Could not read HKCU Office identity data: $($_.Exception.Message)$hkcErrorCtx" `
+            -Recommendation "Run in user context with loaded profile to audit Microsoft 365 sign-in state."
     }
 }
 
@@ -305,6 +355,8 @@ $office365Signals = [pscustomobject]@{
     IsM365FromRegistry  = $isM365FromRegistry
     HasTraditionalOffice = $hasTraditionalOffice
     HasVNextTokens      = $hasVNextTokens
+    IsRunningAsSystem   = $isRunningAsSystem
+    InteractiveUserName = if ($interactiveUserName) { $interactiveUserName } else { $null }
 }
 
 if (-not $windowsLic) {
@@ -1334,6 +1386,8 @@ Write-Host "    HasSignedInIdentity: $($office365Signals.HasSignedInIdentity)"
 Write-Host "    IsM365FromRegistry: $($office365Signals.IsM365FromRegistry)"
 Write-Host "    HasTraditionalOffice: $($office365Signals.HasTraditionalOffice)"
 Write-Host "    HasVNextTokens: $($office365Signals.HasVNextTokens)"
+Write-Host "    IsRunningAsSystem: $($office365Signals.IsRunningAsSystem)"
+Write-Host "    InteractiveUserName: $($office365Signals.InteractiveUserName)"
 
 Write-Host ""
 Write-Host "Findings:" -ForegroundColor Yellow
