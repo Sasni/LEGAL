@@ -614,6 +614,111 @@ if ($cacheDat -and $tokensDat) {
     }
 }
 
+# --- SPP Store Integrity Verification ---
+# Porównanie hashu tokens.dat/data.dat z wzorcem Microsoft nie jest możliwe:
+# zawartość tych plików jest unikalna dla każdej maszyny i zmienia się legalnie
+# przy każdej aktywacji. Bilety HWID wstrzyknięte przez ClipSVC są podpisane
+# kryptograficznie poprawnie — nie do odróżnienia na poziomie podpisu.
+# Weryfikacja integralności opiera się zatem na metadanych systemu plików:
+# ACL, Alternate Data Streams i podpisy cyfrowe binariów SPP.
+
+# Check 8: ACL katalogu SPP store — domyślnie tylko SYSTEM i TrustedInstaller mają zapis
+if (Test-Path -Path $sppStorePath) {
+    try {
+        $sppAcl = Get-Acl -Path $sppStorePath -ErrorAction Stop
+        $sppAccess = $sppAcl.Access | Where-Object {
+            $_.FileSystemRights -match 'Write|Modify|FullControl|Change' -and
+            $_.AccessControlType -eq 'Allow' -and
+            $_.IdentityReference -notmatch '^(NT AUTHORITY\\SYSTEM|NT SERVICE\\TrustedInstaller|BUILTIN\\Administrators)$'
+        }
+        if ($sppAccess) {
+            $grantedTo = ($sppAccess.IdentityReference | Select-Object -Unique) -join ', '
+            Add-Finding -Id "SPP_STORE_ACL_RELAXED" -Severity "High" -Area "MAS HWID" `
+                -Evidence "Katalog SPP store ($sppStorePath) ma nadpisane uprawnienia zapisu dla: $grantedTo. Domyślnie tylko SYSTEM i TrustedInstaller mają dostęp do zapisu." `
+                -Recommendation "Przywróć domyślne uprawnienia NTFS dla katalogu SPP store. Rozszerzone uprawnienia umożliwiają nieautoryzowaną modyfikację bazy aktywacji."
+        }
+    }
+    catch {
+        Add-Finding -Id "SPP_ACL_READ_ERROR" -Severity "Low" -Area "MAS HWID" `
+            -Evidence "Nie można odczytać ACL katalogu SPP store: $($_.Exception.Message)" `
+            -Recommendation "Sprawdź uprawnienia ręcznie w Eksploratorze: Właściwości → Zabezpieczenia."
+    }
+}
+
+# Check 9: ACL na kluczowych plikach SPP (tokens.dat, data.dat, cache.dat)
+$sppKeyFiles = @($tokensDat, $dataDat, $cacheDat) | Where-Object { $_ -ne $null }
+foreach ($sppFile in $sppKeyFiles) {
+    try {
+        $fileAcl = Get-Acl -Path $sppFile.FullName -ErrorAction Stop
+        $fileAccess = $fileAcl.Access | Where-Object {
+            $_.FileSystemRights -match 'Write|Modify|FullControl' -and
+            $_.AccessControlType -eq 'Allow' -and
+            $_.IdentityReference -notmatch '^(NT AUTHORITY\\SYSTEM|NT SERVICE\\TrustedInstaller|BUILTIN\\Administrators)$'
+        }
+        if ($fileAccess) {
+            $grantedTo = ($fileAccess.IdentityReference | Select-Object -Unique) -join ', '
+            Add-Finding -Id "SPP_FILE_ACL_RELAXED" -Severity "High" -Area "MAS HWID" `
+                -Evidence "Plik SPP $($sppFile.Name) ma nadpisane uprawnienia zapisu dla: $grantedTo. Domyślnie tylko SYSTEM ma prawo zapisu." `
+                -Recommendation "Przywróć domyślne ACL na plikach SPP store. Nieautoryzowany dostęp do zapisu umożliwia wstrzyknięcie biletu HWID."
+        }
+    }
+    catch {
+        # Błąd odczytu ACL na pojedynczym pliku — niekrytyczny.
+    }
+}
+
+# Check 10: Alternate Data Streams (ADS) na plikach SPP store
+# Niektóre aktywatory ukrywają dane lub kopie zapasowe w strumieniach NTFS.
+foreach ($sppFile in $sppKeyFiles) {
+    try {
+        $streams = Get-Item -Path $sppFile.FullName -Stream * -ErrorAction Stop
+        $nonDefaultStreams = $streams | Where-Object { $_.Stream -ne ':$DATA' }
+        foreach ($ads in $nonDefaultStreams) {
+            Add-Finding -Id "SPP_FILE_ADS_PRESENT" -Severity "High" -Area "MAS HWID" `
+                -Evidence "Alternate Data Stream wykryty na $($sppFile.Name): '$($ads.Stream)' (rozmiar: $($ads.Length) B)" `
+                -Recommendation "Pliki SPP store nie powinny zawierać alternatywnych strumieni NTFS. Zbadaj zawartość ADS (Get-Content -Stream) i usuń."
+        }
+    }
+    catch {
+        # Błąd odczytu ADS — niekrytyczny (może wystąpić na wolumenach nienależących do NTFS).
+    }
+}
+
+# Check 11: Podpisy cyfrowe wszystkich binariów SPP w System32 i SysWOW64
+# Rozszerza istniejący check SppExtComObj.exe na cały ekosystem SPP.
+$sppBinaryGlobs = @(
+    "$env:SystemRoot\System32\spp*.dll",
+    "$env:SystemRoot\System32\spp*.exe",
+    "$env:SystemRoot\SysWOW64\spp*.dll",
+    "$env:SystemRoot\SysWOW64\spp*.exe"
+)
+foreach ($sppGlob in $sppBinaryGlobs) {
+    $sppBinaries = @(Get-Item -Path $sppGlob -ErrorAction SilentlyContinue)
+    foreach ($bin in $sppBinaries) {
+        # SppExtComObj.exe — już sprawdzony wyżej
+        if ($bin.Name -eq "SppExtComObj.exe") { continue }
+        # DLL-i TSforge — już sprawdzone osobno
+        if ($bin.Name -in @("sppc.dll", "sppcext.dll")) { continue }
+
+        try {
+            $sig = Get-AuthenticodeSignature -FilePath $bin.FullName -ErrorAction Stop
+            if ($sig.Status -ne "Valid") {
+                Add-Finding -Id "SPP_BINARY_INVALID_SIGNATURE" -Severity "High" -Area "MAS HWID" `
+                    -Evidence "Podpis cyfrowy $($bin.Name) jest nieważny (status: $($sig.Status)). Oczekiwano Valid (Microsoft)." `
+                    -Recommendation "Plik binarny SPP mógł zostać zastąpiony. Porównaj hash z czystą wersją Windows dla tej kompilacji i przeprowadź dochodzenie."
+            }
+            elseif ($sig.SignerCertificate.Subject -notmatch "Microsoft") {
+                Add-Finding -Id "SPP_BINARY_UNEXPECTED_SIGNER" -Severity "High" -Area "MAS HWID" `
+                    -Evidence "$($bin.Name) podpisany przez nieoczekiwanego wydawcę: $($sig.SignerCertificate.Subject)" `
+                    -Recommendation "Plik SPP z nie-microsoftowym podpisem — prawdopodobna podmiana. Zbierz hash i eskalij do analizy forensiczej."
+            }
+        }
+        catch {
+            # Błąd odczytu podpisu pojedynczego pliku — niekrytyczny.
+        }
+    }
+}
+
 # --- Forensic Traces: detect deleted or previously-run activator tools ---
 
 # Prefetch files survive EXE deletion and record execution time.
@@ -904,6 +1009,30 @@ if ($tsforgeFileFinding -and $sppModFinding) {
     Add-Finding -Id "CORR_TSFORGE_ACTIVE" -Severity "Critical" -Area "Correlation" `
         -Evidence "TSforge hook DLL present ($($tsforgeFileFinding.Evidence)) combined with SPP store modification ($($sppModFinding[0].Evidence)). Both artefacts of TSforge activation detected simultaneously." `
         -Recommendation "High-confidence TSforge activation detected. Remove hook DLLs and SPP modifications, then reactivate Windows legitimately."
+}
+
+# RULE 9: SPP store ACL relaxed + SPP store modification → active tampering with file system
+$sppAclHit = $findings | Where-Object { $_.Id -in @("SPP_STORE_ACL_RELAXED", "SPP_FILE_ACL_RELAXED") }
+if ($sppAclHit -and $sppModFinding) {
+    Add-Finding -Id "CORR_SPP_ACL_TAMPER" -Severity "Critical" -Area "Correlation" `
+        -Evidence "SPP store ACL relaxed ($($sppAclHit[0].Evidence)) combined with SPP store modification ($($sppModFinding[0].Evidence)). File system permissions were changed to enable unauthorized activation." `
+        -Recommendation "Restore default NTFS ACL on SPP store directory and files, then validate activation state through official channels."
+}
+
+# RULE 10: SPP file ADS present + SPP store modification → stealth tampering
+$sppAdsHit = $findings | Where-Object { $_.Id -eq "SPP_FILE_ADS_PRESENT" }
+if ($sppAdsHit -and $sppModFinding) {
+    Add-Finding -Id "CORR_SPP_ADS_TAMPER" -Severity "Critical" -Area "Correlation" `
+        -Evidence "Alternate Data Stream on SPP store file ($($sppAdsHit.Evidence)) combined with SPP store modification ($($sppModFinding[0].Evidence)). ADS is a known technique for hiding activator payloads." `
+        -Recommendation "Investigate ADS content on SPP files (Get-Content -Stream) and remove unauthorized streams. Validate activation state."
+}
+
+# RULE 11: SPP binary invalid signature + SPP store modification → binary replacement + activation tampering
+$sppSigHit = $findings | Where-Object { $_.Id -in @("SPP_BINARY_INVALID_SIGNATURE", "SPP_BINARY_UNEXPECTED_SIGNER") }
+if ($sppSigHit -and $sppModFinding) {
+    Add-Finding -Id "CORR_SPP_BINARY_TAMPER" -Severity "Critical" -Area "Correlation" `
+        -Evidence "SPP binary with invalid/unexpected signature ($($sppSigHit[0].Evidence)) combined with SPP store modification ($($sppModFinding[0].Evidence)). Binary replacement and store tampering detected together." `
+        -Recommendation "Replace tampered SPP binaries from known-good Windows media and re-validate activation. Escalate for forensic investigation."
 }
 
 # --- End Correlation Rule Engine ---
