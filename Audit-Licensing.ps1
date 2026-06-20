@@ -150,7 +150,12 @@ $officeIdentityProfilesPath = "HKCU:\Software\Microsoft\Office\16.0\Common\Ident
 
 $allLic = @()
 try {
-    $allLic = Get-CimInstance -ClassName SoftwareLicensingProduct | Where-Object { $_.PartialProductKey }
+    # WQL z filtrem ApplicationId po stronie serwera CIM — unika pobierania
+    # setek wpisów SPP (każdy komponent systemu) i wymuszania na usłudze SPP
+    # przeliczania stanu licencji dla niepotrzebnych komponentów.
+    # Bez filtru zapytanie może trwać 30-120s na starszych maszynach.
+    $licenseQuery = "SELECT * FROM SoftwareLicensingProduct WHERE ApplicationId = '$windowsAppId' OR ApplicationId = '$officeAppId' OR ApplicationId = '$office2010AppId'"
+    $allLic = Get-CimInstance -Query $licenseQuery -ErrorAction Stop | Where-Object { $_.PartialProductKey }
 }
 catch {
     Add-Finding -Id "CIM_READ_ERROR" -Severity "Medium" -Area "Licensing API" -Evidence "Cannot read SoftwareLicensingProduct: $($_.Exception.Message)" -Recommendation "Run script with Administrator rights and confirm WMI/CIM service health."
