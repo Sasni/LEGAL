@@ -357,16 +357,37 @@ $office365Signals = [pscustomobject]@{
     HasVNextTokens      = $hasVNextTokens
     IsRunningAsSystem   = $isRunningAsSystem
     InteractiveUserName = if ($interactiveUserName) { $interactiveUserName } else { $null }
+    IsSharedComputerActivation = $isSharedComputerActivation
 }
 
 if (-not $windowsLic) {
     Add-Finding -Id "WINDOWS_LICENSE_NOT_FOUND" -Severity "Medium" -Area "Windows" -Evidence "No Windows licensing product with PartialProductKey found in CIM." -Recommendation "Verify OS licensing service health and inspect slmgr /dlv manually."
 }
 
+# Shared Computer Activation (SCA): M365 na RDS/VDI/terminalach.
+# W SCA tokeny są per-sesja, nie zostają trwale w HKCU — brak identity
+# i tokenów vNext jest OCZEKIWANY. Nie można z tego wnioskować o braku licencji.
+$isSharedComputerActivation = $false
+try {
+    $scaPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Office\16.0\Common\Licensing",
+        "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
+    )
+    foreach ($scaPath in $scaPaths) {
+        $scaVal = Get-ItemProperty -Path $scaPath -Name "SharedComputerLicensing" -ErrorAction SilentlyContinue
+        if ($scaVal -and $scaVal.SharedComputerLicensing -eq 1) {
+            $isSharedComputerActivation = $true
+            break
+        }
+    }
+}
+catch { }
+
 if (-not $officeLic) {
     # Nowoczesne Microsoft 365 Apps NIE UŻYWAJĄ lokalnych kluczy produktu (PartialProductKey).
-    # Aktywacja opiera się na tokenie użytkownika (vNext) i tożsamości M365.
-    # Tylko tradycyjny Office (2016/2019/2021 LTSC, wolumen) wymaga klucza SPP.
+    # Aktywacja opiera się na tokenie użytkownika (vNext) lub licencji urządzenia.
+    # Brak zalogowanego użytkownika NIE JEST anomalią — SCA, device-based license
+    # i licencje wolumenowe działają bez tożsamości HKCU.
     $userHasIdentity = $office365Identity -and $office365Identity.IsOffice365Account
 
     if ($isM365FromRegistry -and ($userHasIdentity -or $hasVNextTokens)) {
@@ -380,10 +401,15 @@ if (-not $officeLic) {
             -Recommendation "M365 używa aktywacji subskrypcyjnej — klucz SPP nie jest wymagany. Zweryfikuj przypisanie licencji w M365 Admin Center."
     }
     elseif ($isM365FromRegistry -and -not $userHasIdentity -and -not $hasVNextTokens) {
-        # M365 zainstalowane, ale użytkownik nie jest zalogowany i brak tokenów — problem
-        Add-Finding -Id "OFFICE_M365_NO_SIGNIN" -Severity "Low" -Area "Office 365" `
-            -Evidence "Microsoft 365 Apps wykryte w rejestrze, ale brak zalogowanego użytkownika HKCU ani tokenów vNext. Produkty: $(($m365Products.DisplayName | Select-Object -First 3) -join '; ')" `
-            -Recommendation "M365 nie używa lokalnych kluczy. Zaloguj się licencjonowanym kontem (Plik → Konto → Zaloguj się). Bez logowania aplikacje działają w trybie tylko do odczytu."
+        # M365 bez identity i tokenów — NIE JEST automatycznie podejrzane.
+        # Legalne scenariusze: Shared Computer Activation (RDS/VDI), device-based
+        # license, licencja wolumenowa, użytkownik jeszcze się nie zalogował,
+        # lub tokeny są w innym profilu (skrypt jako SYSTEM/Admin).
+        $scaNote = if ($isSharedComputerActivation) { " Wykryto SharedComputerLicensing=1 — to wyjaśnia brak tożsamości HKCU." } else { "" }
+        $ctxNote = if ($isRunningAsSystem) { " Skrypt jako SYSTEM — tokeny mogą być w profilu $interactiveUserName." } else { "" }
+        Add-Finding -Id "OFFICE_M365_NO_SIGNIN" -Severity "Info" -Area "Office 365" `
+            -Evidence "Microsoft 365 Apps wykryte w rejestrze, brak tożsamości HKCU i tokenów vNext.$scaNote$ctxNote Produkty: $(($m365Products.DisplayName | Select-Object -First 3) -join '; ')" `
+            -Recommendation "To NIE jest anomalia. M365 może działać bez trwale zalogowanego użytkownika: Shared Computer Activation, device-based license, licencja wolumenowa. Jeśli aplikacje działają poprawnie — nie ma problemu."
     }
     elseif ($hasTraditionalOffice) {
         # Tradycyjny Office BEZ klucza SPP — to jest podejrzane
@@ -410,7 +436,12 @@ if ($office365Signals.HasSubscriptionSku) {
 }
 
 if ($office365Signals.HasSubscriptionSku -and -not $office365Signals.HasSignedInIdentity) {
-    Add-Finding -Id "OFFICE365_SUB_NO_SIGNIN" -Severity "Low" -Area "Office 365" -Evidence "Subscription SKU detected but no signed-in Office identity found in current HKCU profile." -Recommendation "Confirm the script runs in the same user context that signs in to Office, or validate Shared Computer Activation setup."
+    # Subskrypcyjny SKU w CIM + brak identity HKCU. NIE jest automatycznie podejrzane:
+    # SCA, device-based license, SYSTEM context, lub użytkownik jeszcze się nie zalogował.
+    $subCtxNote = if ($isSharedComputerActivation) { " SharedComputerLicensing=1 — SCA wyjaśnia brak identity." } elseif ($isRunningAsSystem) { " Skrypt jako SYSTEM — identity może być w profilu $interactiveUserName." } else { "" }
+    Add-Finding -Id "OFFICE365_SUB_NO_SIGNIN" -Severity "Info" -Area "Office 365" `
+        -Evidence "Subskrypcyjny SKU Office wykryty w CIM, ale brak zalogowanej tożsamości w HKCU.$subCtxNote" `
+        -Recommendation "To NIE jest anomalia jeśli używasz Shared Computer Activation, device-based license lub licencji wolumenowej. Jeśli aplikacje Office działają — licencja jest prawidłowa."
 }
 
 # Do not classify GVLK as illegal by itself.
@@ -1430,6 +1461,7 @@ Write-Host "    HasTraditionalOffice: $($office365Signals.HasTraditionalOffice)"
 Write-Host "    HasVNextTokens: $($office365Signals.HasVNextTokens)"
 Write-Host "    IsRunningAsSystem: $($office365Signals.IsRunningAsSystem)"
 Write-Host "    InteractiveUserName: $($office365Signals.InteractiveUserName)"
+Write-Host "    IsSharedComputerActivation: $($office365Signals.IsSharedComputerActivation)"
 
 Write-Host ""
 Write-Host "Findings:" -ForegroundColor Yellow
