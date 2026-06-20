@@ -505,20 +505,108 @@ try {
 }
 catch { }
 
+# --- Kontekst pomocniczy: upgrade Windows i instalacja Office ---
+# Te dane pozwalają odróżnić naturalne modyfikacje SPP od wstrzyknięcia HWID.
+# SPP store jest legalnie modyfikowany przy: upgrade Windows (7→10, 10→11),
+# feature update (build upgrade), aktywacji Office, zmianie edycji, slmgr.
+
+# Wykrycie upgrade'u Windows (np. 7→10, 10→11) — klucz istnieje tylko po upgrade
+$isWindowsUpgraded = $false
+$windowsUpgradeDate = $null
+try {
+    $setupKey = "HKLM:\SYSTEM\Setup"
+    $sourceOsUpdated = Get-ItemProperty -Path $setupKey -Name "Source OS (Updated on)" -ErrorAction SilentlyContinue
+    if ($sourceOsUpdated -and $sourceOsUpdated.'Source OS (Updated on)') {
+        $rawDate = $sourceOsUpdated.'Source OS (Updated on)'
+        try { $windowsUpgradeDate = Get-Date -Date $rawDate -ErrorAction Stop; $isWindowsUpgraded = $true } catch { }
+    }
+}
+catch { }
+
+# Druga ścieżka: MoSetup (Modern Setup) używany przy upgrade przez Windows Update
+if (-not $isWindowsUpgraded) {
+    try {
+        $moSetup = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MoSetup" -Name "UpgradeCodeDate" -ErrorAction SilentlyContinue
+        if ($moSetup -and $moSetup.UpgradeCodeDate) {
+            $isWindowsUpgraded = $true
+        }
+    }
+    catch { }
+}
+
+# Data ostatniej instalacji Office — do korelacji z datą modyfikacji SPP
+$officeInstallDates = @($officeInstalled | Where-Object { $_.InstallDate } | ForEach-Object {
+        try { Get-Date $_.InstallDate -ErrorAction Stop } catch { $null }
+    } | Where-Object { $_ -ne $null } | Sort-Object -Descending)
+$latestOfficeInstallDate = if ($officeInstallDates.Count -gt 0) { $officeInstallDates[0] } else { $null }
+
 # Check 1: tokens.dat — czas modyfikacji vs data instalacji Windows
+# Trójstopniowa ocena: >365 dni (Medium), 90-365 dni (Low), <=90 dni (pominięte).
+# Dodatkowo sprawdza legalne wyjaśnienia: upgrade Windows, instalacja Office, feature update.
 $tokensDat = $sppStoreFiles | Where-Object { $_.Name -eq "tokens.dat" } | Select-Object -First 1
 if ($tokensDat -and $windowsInstallDate) {
     $daysAfterInstall = [math]::Round(($tokensDat.LastWriteTime - $windowsInstallDate).TotalDays, 0)
+    $tokensModDate = $tokensDat.LastWriteTime
 
-    # Jeśli tokens.dat zmodyfikowany > 90 dni po instalacji -> podejrzane
-    if ($daysAfterInstall -gt 90) {
-        Add-Finding -Id "SPP_TOKENS_MODIFIED_AFTER_INSTALL" -Severity "Medium" -Area "MAS HWID" `
-            -Evidence "tokens.dat zmodyfikowany $daysAfterInstall dni po instalacji Windows. Instalacja: $($windowsInstallDate.ToString('yyyy-MM-dd')). tokens.dat: $($tokensDat.LastWriteTime.ToString('yyyy-MM-dd HH:mm')). Aktywacja HWID nadpisuje SPP token store." `
-            -Recommendation "Zweryfikuj czy modyfikacja pokrywa się z legalną aktywacją (feature update, zmiana edycji). Jeśli nie — porównaj z dokumentacją zakupu sprzętu."
+    # Określenie czy istnieje legalne wyjaśnienie modyfikacji SPP
+    $legitimateReason = ""
+
+    # Wyjaśnienie A: upgrade Windows (7→10, 10→11) w pobliżu daty modyfikacji SPP
+    if ($windowsUpgradeDate) {
+        $daysFromUpgrade = [math]::Abs(($tokensModDate - $windowsUpgradeDate).TotalDays)
+        if ($daysFromUpgrade -le 30) {
+            $legitimateReason = "upgrade Windows (data upgrade'u: $($windowsUpgradeDate.ToString('yyyy-MM-dd')), różnica $([math]::Round($daysFromUpgrade,0)) dni od modyfikacji tokens.dat)"
+        }
     }
 
+    # Wyjaśnienie B: instalacja Office w pobliżu daty modyfikacji SPP
+    if (-not $legitimateReason -and $latestOfficeInstallDate) {
+        $daysFromOffice = [math]::Abs(($tokensModDate - $latestOfficeInstallDate).TotalDays)
+        if ($daysFromOffice -le 14) {
+            $legitimateReason = "instalacja Office (data: $($latestOfficeInstallDate.ToString('yyyy-MM-dd')), różnica $([math]::Round($daysFromOffice,0)) dni od modyfikacji tokens.dat)"
+        }
+    }
+
+    # Wyjaśnienie C: feature update / upgrade wykryty po numerze buildu
+    # Np. build >= 22000 (Win11) ale instalacja przed premierą Win11 (2021-10)
+    if (-not $legitimateReason -and $osInfo) {
+        try {
+            $currentBuild = [int]$osInfo.BuildNumber
+            if ($currentBuild -ge 22000 -and $windowsInstallDate -lt (Get-Date "2021-10-01")) {
+                $legitimateReason = "prawdopodobny upgrade do Windows 11 (build $currentBuild, oryginalna instalacja $($windowsInstallDate.ToString('yyyy-MM')))"
+            }
+        }
+        catch { }
+    }
+
+    # --- Ocena trójstopniowa ---
+    if ($daysAfterInstall -gt 365) {
+        # Ponad rok po instalacji — silnie podejrzane, chyba że wykryto upgrade
+        if ($legitimateReason) {
+            Add-Finding -Id "SPP_TOKENS_MODIFIED_AFTER_INSTALL" -Severity "Info" -Area "MAS HWID" `
+                -Evidence "tokens.dat zmodyfikowany $daysAfterInstall dni po instalacji Windows. Instalacja: $($windowsInstallDate.ToString('yyyy-MM-dd')). tokens.dat: $($tokensModDate.ToString('yyyy-MM-dd HH:mm')). Wyjaśnienie: $legitimateReason." `
+                -Recommendation "Modyfikacja SPP wyjaśniona przez wykrytą operację systemową. Jeśli jej nie pamiętasz — zweryfikuj aktywację przez slmgr /dlv."
+        }
+        else {
+            Add-Finding -Id "SPP_TOKENS_MODIFIED_AFTER_INSTALL" -Severity "Medium" -Area "MAS HWID" `
+                -Evidence "tokens.dat zmodyfikowany $daysAfterInstall dni po instalacji Windows. Instalacja: $($windowsInstallDate.ToString('yyyy-MM-dd')). tokens.dat: $($tokensModDate.ToString('yyyy-MM-dd HH:mm')). Brak znanego legalnego wyjaśnienia (brak śladów upgrade'u Windows ani instalacji Office w pobliżu tej daty)." `
+                -Recommendation "Zweryfikuj czy modyfikacja pokrywa się z upgrade'em Windows (7→10, 10→11), feature update, instalacją Office lub zmianą edycji. Jeśli żadna z tych operacji nie miała miejsca — podejrzenie aktywacji HWID."
+        }
+    }
+    elseif ($daysAfterInstall -gt 90) {
+        # 90-365 dni: możliwy upgrade, Office, feature update — niższa pewność
+        if (-not $legitimateReason) {
+            Add-Finding -Id "SPP_TOKENS_MODIFIED_AFTER_INSTALL" -Severity "Low" -Area "MAS HWID" `
+                -Evidence "tokens.dat zmodyfikowany $daysAfterInstall dni po instalacji Windows. Instalacja: $($windowsInstallDate.ToString('yyyy-MM-dd')). tokens.dat: $($tokensModDate.ToString('yyyy-MM-dd HH:mm')). Brak wykrytego upgrade'u Windows ani instalacji Office w pobliżu tej daty." `
+                -Recommendation "Może wynikać z nieuchwyconego upgrade'u Windows (7→10, 10→11), feature update, instalacji Office lub ręcznej aktywacji. Jeśli nie przypominasz sobie żadnej takiej operacji — uruchom slmgr /dlv."
+        }
+        # Jeśli legitimateReason istnieje — pomijamy finding (wystarczające wyjaśnienie)
+    }
+    # <= 90 dni: pomijamy — zbyt świeże by odróżnić naturalną fluktuację SPP od HWID
+
     # Check 2: tokens.dat zmodyfikowany podczas trwającej sesji (bez rebootu) -> silny sygnał HWID
-    $hoursSinceTokenMod = [math]::Round(((Get-Date) - $tokensDat.LastWriteTime).TotalHours, 2)
+    # Ten check jest niezależny od upgrade'ów — modyfikacja SPP w trakcie sesji zawsze podejrzana
+    $hoursSinceTokenMod = [math]::Round(((Get-Date) - $tokensModDate).TotalHours, 2)
     if ($hoursSinceTokenMod -lt 48 -and $lastBootTime) {
         $uptimeHours = [math]::Round(((Get-Date) - $lastBootTime).TotalHours, 2)
         if ($uptimeHours -gt 48 -and $hoursSinceTokenMod -lt $uptimeHours) {
