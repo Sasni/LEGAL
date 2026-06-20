@@ -613,6 +613,50 @@ foreach ($check in $kmsRegChecks) {
     }
 }
 
+# KMS DNS SRV: w domenie AD, legalny serwer KMS jest publikowany przez DNS
+# jako _VLMCS._TCP.<domena>. Jeśli skonfigurowany host KMS NIE pasuje do
+# rekordu SRV, może to wskazywać na zewnętrzny emulator KMS.
+$kmsDnsMismatch = $false
+try {
+    $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+    if ($cs.PartOfDomain -and $cs.Domain) {
+        $kmsSrvRecord = "_VLMCS._TCP.$($cs.Domain)"
+        try {
+            $dnsResult = Resolve-DnsName -Name $kmsSrvRecord -Type SRV -ErrorAction Stop |
+                Where-Object { $_.QueryType -eq 'SRV' } |
+                Select-Object -First 1
+            if ($dnsResult) {
+                $advertisedKms = $dnsResult.NameTarget.TrimEnd('.')
+                # Porównaj z hostem KMS w rejestrze (obie ścieżki)
+                foreach ($check in $kmsRegChecks) {
+                    $kmsHost = Get-RegistryValue -Path $check.Path -Name "KeyManagementServiceName"
+                    if ($kmsHost -and -not [string]::IsNullOrWhiteSpace($kmsHost)) {
+                        # Normalizuj: usuń port, porównaj hostname
+                        $hostOnly = ($kmsHost -split ':')[0]
+                        if ($hostOnly -notmatch [regex]::Escape($advertisedKms) -and
+                            $advertisedKms -notmatch [regex]::Escape($hostOnly)) {
+                            $kmsDnsMismatch = $true
+                        }
+                    }
+                }
+            } else {
+                # Brak rekordu SRV KMS w domenie — to nie jest typowe dla AD z KMS
+                # (może być ADBA, więc tylko Info)
+            }
+        }
+        catch {
+            Write-Debug "DNS KMS SRV query failed: $($_.Exception.Message)"
+        }
+    }
+}
+catch { Write-Debug "ComputerSystem domain check failed: $($_.Exception.Message)" }
+
+if ($kmsDnsMismatch) {
+    Add-Finding -Id "KMS_DNS_MISMATCH" -Severity "High" -Area "KMS" `
+        -Evidence "Skonfigurowany host KMS NIE pasuje do rekordu SRV domeny ($kmsSrvRecord → $advertisedKms). KMS wskazuje na serwer spoza infrastruktury AD." `
+        -Recommendation "Zweryfikuj czy host KMS należy do organizacji. Jeśli nie — może to być zewnętrzny emulator KMS używany przez MAS lub inny aktywator."
+}
+
 # slmgr output can provide extra hints, but strings are locale dependent.
 try {
     $slmgrOutput = cscript //nologo C:\Windows\System32\slmgr.vbs /dlv 2>&1 | Out-String
@@ -1256,6 +1300,19 @@ catch {
 # --- Correlation Rule Engine ---
 # Runs AFTER all individual checks. Correlates multiple weak signals into
 # high-confidence findings. Does not replace granular findings, only adds to them.
+#
+# UCZCIWE OGRANICZENIA — czego skrypt NIE wykryje:
+# - MAS HWID po restarcie bez GenuineTicket.xml: kryptograficznie identyczny
+#   z legalna licencja cyfrowa. Tylko slad wykonania skryptu (PowerShell log,
+#   AMSI) moze go ujawnic. Timestampy SPP NIE sa dowodem.
+# - MAS KMS38 / Online KMS ze zdalnym serwerem KMS w domenie: jesli emulator
+#   dziala na zewnetrznym serwerze i publikuje sie przez DNS — nieodroznialny
+#   od legalnego KMS enterprise bez analizy ruchu sieciowego.
+# - Kazdy aktywator obfuskujacy nazwy plikow i nie tworzacy zadan harmonogramu:
+#   ominie Prefetch i Recycle Bin. AMSI i PowerShell log (wzorce behawioralne)
+#   sa jedyna obrona — wymagaja wlaczonego Defendera i Operational log.
+# - TSforge w pamieci (in-memory driver): bez plikow DLL na dysku. Tylko AMSI
+#   lub zaawansowana analiza forensicza (Volatility) moze go wykryc.
 
 $foundIds = { param($id) $findings | Where-Object { $_.Id -eq $id } }
 
