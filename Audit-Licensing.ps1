@@ -197,6 +197,28 @@ foreach ($uPath in $uninstallPaths) {
     }
 }
 
+# Klasyfikacja: Microsoft 365 Apps (subskrypcyjne, bez klucza SPP) vs tradycyjny Office (wymaga klucza)
+$m365Products = @($officeInstalled | Where-Object { $_.DisplayName -match '(?i)Microsoft 365' })
+$isM365FromRegistry = $m365Products.Count -gt 0
+
+$traditionalProducts = @($officeInstalled | Where-Object {
+    $_.DisplayName -match '(?i)(Office|Visio|Project).*(Professional|Standard|Home|Enterprise|20\d{2}|LTSC)' -and
+    $_.DisplayName -notmatch '(?i)Microsoft 365'
+})
+$hasTraditionalOffice = $traditionalProducts.Count -gt 0
+
+# vNext licensing: M365 Apps używają tokenów użytkownika zamiast lokalnych kluczy SPP.
+# Pliki .auth w %LOCALAPPDATA%\Microsoft\Office\16.0\Licensing potwierdzają aktywację.
+$hasVNextTokens = $false
+$vNextLicensePath = "$env:LOCALAPPDATA\Microsoft\Office\16.0\Licensing"
+if (Test-Path -Path $vNextLicensePath) {
+    try {
+        $authFiles = Get-ChildItem -Path $vNextLicensePath -Filter "*.auth" -ErrorAction Stop
+        $hasVNextTokens = ($authFiles.Count -gt 0)
+    }
+    catch { }
+}
+
 $subscriptionEntries = @($officeSummary | Where-Object { $_.Description -match "TIMEBASED_SUB|SUB" -or $_.Name -match "O365|Microsoft 365|Subscription" })
 $hasOffice365SubscriptionSku = $subscriptionEntries.Count -gt 0
 
@@ -270,10 +292,13 @@ if (Test-Path -Path $officeIdentityPath) {
 }
 
 $office365Signals = [pscustomobject]@{
-    HasSubscriptionSku = $hasOffice365SubscriptionSku
+    HasSubscriptionSku  = $hasOffice365SubscriptionSku
     SubscriptionSkuCount = $subscriptionEntries.Count
-    HasIdentityProfile = [bool]$office365Identity
+    HasIdentityProfile  = [bool]$office365Identity
     HasSignedInIdentity = [bool]($office365Identity -and $office365Identity.IsOffice365Account)
+    IsM365FromRegistry  = $isM365FromRegistry
+    HasTraditionalOffice = $hasTraditionalOffice
+    HasVNextTokens      = $hasVNextTokens
 }
 
 if (-not $windowsLic) {
@@ -281,17 +306,45 @@ if (-not $windowsLic) {
 }
 
 if (-not $officeLic) {
-    $officeMissingSeverity = "Low"
-    $officeMissingEvidence = "No Office licensing product with PartialProductKey found. Office may be absent or not locally key-licensed."
-    $officeMissingRecommendation = "If Office apps are used, verify Microsoft 365 user license assignment and app sign-in status."
+    # Nowoczesne Microsoft 365 Apps NIE UŻYWAJĄ lokalnych kluczy produktu (PartialProductKey).
+    # Aktywacja opiera się na tokenie użytkownika (vNext) i tożsamości M365.
+    # Tylko tradycyjny Office (2016/2019/2021 LTSC, wolumen) wymaga klucza SPP.
+    $userHasIdentity = $office365Identity -and $office365Identity.IsOffice365Account
 
-    if ($office365Identity -and $office365Identity.IsOffice365Account) {
-        $officeMissingSeverity = "Info"
-        $officeMissingEvidence = "No local Office key license found, but Microsoft 365 user identity is present in HKCU."
-        $officeMissingRecommendation = "This can be expected for subscription licensing. Confirm tenant assignment in Microsoft 365 admin portal."
+    if ($isM365FromRegistry -and ($userHasIdentity -or $hasVNextTokens)) {
+        # M365 + zalogowany użytkownik lub token vNext = normalna aktywacja subskrypcyjna.
+        # Brak PartialProductKey w CIM jest OCZEKIWANY. Nie tworzymy findingu o braku klucza.
+        $m365Evidence = "Microsoft 365 Apps: brak lokalnego klucza SPP (oczekiwane)."
+        if ($userHasIdentity) { $m365Evidence += " Użytkownik zalogowany: $($office365Identity.SignInName)" }
+        if ($hasVNextTokens) { $m365Evidence += " Tokeny vNext obecne." }
+        Add-Finding -Id "OFFICE_M365_VNEXT_ACTIVATED" -Severity "Info" -Area "Office 365" `
+            -Evidence $m365Evidence `
+            -Recommendation "M365 używa aktywacji subskrypcyjnej — klucz SPP nie jest wymagany. Zweryfikuj przypisanie licencji w M365 Admin Center."
     }
-
-    Add-Finding -Id "OFFICE_LICENSE_NOT_FOUND" -Severity $officeMissingSeverity -Area "Office" -Evidence $officeMissingEvidence -Recommendation $officeMissingRecommendation
+    elseif ($isM365FromRegistry -and -not $userHasIdentity -and -not $hasVNextTokens) {
+        # M365 zainstalowane, ale użytkownik nie jest zalogowany i brak tokenów — problem
+        Add-Finding -Id "OFFICE_M365_NO_SIGNIN" -Severity "Low" -Area "Office 365" `
+            -Evidence "Microsoft 365 Apps wykryte w rejestrze, ale brak zalogowanego użytkownika HKCU ani tokenów vNext. Produkty: $(($m365Products.DisplayName | Select-Object -First 3) -join '; ')" `
+            -Recommendation "M365 nie używa lokalnych kluczy. Zaloguj się licencjonowanym kontem (Plik → Konto → Zaloguj się). Bez logowania aplikacje działają w trybie tylko do odczytu."
+    }
+    elseif ($hasTraditionalOffice) {
+        # Tradycyjny Office BEZ klucza SPP — to jest podejrzane
+        Add-Finding -Id "OFFICE_LICENSE_NOT_FOUND" -Severity "Medium" -Area "Office" `
+            -Evidence "Tradycyjny Office (wolumen/retail) wykryty w rejestrze, ale brak PartialProductKey w CIM. Produkty: $(($traditionalProducts.DisplayName | Select-Object -First 3) -join '; ')" `
+            -Recommendation "Tradycyjny Office wymaga klucza produktu. Sprawdź stan aktywacji w aplikacji (Plik → Konto) i skoreluj z dokumentacją licencyjną."
+    }
+    elseif ($officeInstalled.Count -gt 0) {
+        # Office w rejestrze, ale nie sklasyfikowany jako M365 ani tradycyjny
+        Add-Finding -Id "OFFICE_LICENSE_NOT_FOUND" -Severity "Low" -Area "Office" `
+            -Evidence "Produkty Office w rejestrze bez lokalnego klucza SPP: $(($officeInstalled.DisplayName | Select-Object -First 3) -join '; ')" `
+            -Recommendation "Jeśli to Microsoft 365 Apps — zaloguj się (M365 nie używa kluczy). Jeśli tradycyjny Office — zweryfikuj klucz produktu."
+    }
+    else {
+        # Office nie jest zainstalowany — informacja, nie anomalia
+        Add-Finding -Id "OFFICE_NOT_INSTALLED" -Severity "Info" -Area "Office" `
+            -Evidence "Nie wykryto instalacji Office ani w rejestrze, ani w CIM." `
+            -Recommendation "Office nie jest zainstalowany na tym komputerze. Jeśli korzystasz z aplikacji Office — sprawdź ich źródło (Office Online, aplikacje PWA)."
+    }
 }
 
 if ($office365Signals.HasSubscriptionSku) {
@@ -1213,6 +1266,9 @@ Write-Host "  - HasSubscriptionSku: $($office365Signals.HasSubscriptionSku)"
 Write-Host "    SubscriptionSkuCount: $($office365Signals.SubscriptionSkuCount)"
 Write-Host "    HasIdentityProfile: $($office365Signals.HasIdentityProfile)"
 Write-Host "    HasSignedInIdentity: $($office365Signals.HasSignedInIdentity)"
+Write-Host "    IsM365FromRegistry: $($office365Signals.IsM365FromRegistry)"
+Write-Host "    HasTraditionalOffice: $($office365Signals.HasTraditionalOffice)"
+Write-Host "    HasVNextTokens: $($office365Signals.HasVNextTokens)"
 
 Write-Host ""
 Write-Host "Findings:" -ForegroundColor Yellow
