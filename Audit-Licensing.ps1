@@ -531,9 +531,20 @@ catch {
 
 # --- HWID / TSforge Detection ---
 # HWID (Hardware ID) to najczęściej używana dziś metoda MAS do aktywacji Windows.
-# Nie zostawia plików ani zadań — jedynym śladem jest modyfikacja bazy SPP
-# (tokens.dat, data.dat, cache.dat) oraz potencjalnie pozostałość GenuineTicket.xml.
-# TSforge to nowsza metoda działająca na poziomie pamięci/sterownika jądra.
+# Używa ClipSVC do wygenerowania biletu podpisanego kryptograficznie przez Microsoft
+# — jest NIEROZRÓŻNIALNY od legalnej licencji cyfrowej na poziomie API i SPP store.
+#
+# OSTRZEŻENIE: HWID NIE MOŻNA wykryć przez porównanie daty modyfikacji plików SPP.
+# LastWriteTime tokens.dat/data.dat/cache.dat zmienia się przy KAŻDEJ legalnej operacji:
+# Windows Update, feature update, instalacji Office, odzyskiwaniu SPP, zmianie strefy.
+# Timestampy w tej sekcji NIE SĄ samodzielnymi findingami — służą wyłącznie jako
+# sygnał pomocniczy do korelacji z MOCNIEJSZYMI dowodami (GenuineTicket.xml,
+# PowerShell event log, ślady forensyczne).
+#
+# Jedyne twarde dowody HWID/TSforge w tym skrypcie:
+# - GenuineTicket.xml w ClipSVC (Check 4) — artefakt wstrzyknięcia biletu
+# - Wpisy w PowerShell Operational log (sekcja Forensic Traces)
+# - Ślady forensyczne plików aktywatorów (Recycle Bin, Prefetch, Security log)
 
 $sppStorePath = "$env:SystemRoot\System32\spp\store\2.0"
 $sppStoreFiles = @()
@@ -633,53 +644,40 @@ if ($tokensDat -and $windowsInstallDate) {
     }
 
     # --- Ocena trójstopniowa ---
-    if ($daysAfterInstall -gt 365) {
-        # Ponad rok po instalacji — silnie podejrzane, chyba że wykryto upgrade
-        if ($legitimateReason) {
-            Add-Finding -Id "SPP_TOKENS_MODIFIED_AFTER_INSTALL" -Severity "Info" -Area "MAS HWID" `
-                -Evidence "tokens.dat zmodyfikowany $daysAfterInstall dni po instalacji Windows. Instalacja: $($windowsInstallDate.ToString('yyyy-MM-dd')). tokens.dat: $($tokensModDate.ToString('yyyy-MM-dd HH:mm')). Wyjaśnienie: $legitimateReason." `
-                -Recommendation "Modyfikacja SPP wyjaśniona przez wykrytą operację systemową. Jeśli jej nie pamiętasz — zweryfikuj aktywację przez slmgr /dlv."
-        }
-        else {
-            Add-Finding -Id "SPP_TOKENS_MODIFIED_AFTER_INSTALL" -Severity "Medium" -Area "MAS HWID" `
-                -Evidence "tokens.dat zmodyfikowany $daysAfterInstall dni po instalacji Windows. Instalacja: $($windowsInstallDate.ToString('yyyy-MM-dd')). tokens.dat: $($tokensModDate.ToString('yyyy-MM-dd HH:mm')). Brak znanego legalnego wyjaśnienia (brak śladów upgrade'u Windows ani instalacji Office w pobliżu tej daty)." `
-                -Recommendation "Zweryfikuj czy modyfikacja pokrywa się z upgrade'em Windows (7→10, 10→11), feature update, instalacją Office lub zmianą edycji. Jeśli żadna z tych operacji nie miała miejsca — podejrzenie aktywacji HWID."
-        }
-    }
-    elseif ($daysAfterInstall -gt 90) {
-        # 90-365 dni: możliwy upgrade, Office, feature update — niższa pewność
-        if (-not $legitimateReason) {
-            Add-Finding -Id "SPP_TOKENS_MODIFIED_AFTER_INSTALL" -Severity "Low" -Area "MAS HWID" `
-                -Evidence "tokens.dat zmodyfikowany $daysAfterInstall dni po instalacji Windows. Instalacja: $($windowsInstallDate.ToString('yyyy-MM-dd')). tokens.dat: $($tokensModDate.ToString('yyyy-MM-dd HH:mm')). Brak wykrytego upgrade'u Windows ani instalacji Office w pobliżu tej daty." `
-                -Recommendation "Może wynikać z nieuchwyconego upgrade'u Windows (7→10, 10→11), feature update, instalacji Office lub ręcznej aktywacji. Jeśli nie przypominasz sobie żadnej takiej operacji — uruchom slmgr /dlv."
-        }
-        # Jeśli legitimateReason istnieje — pomijamy finding (wystarczające wyjaśnienie)
-    }
-    # <= 90 dni: pomijamy — zbyt świeże by odróżnić naturalną fluktuację SPP od HWID
+    # --- Ocena osi czasu SPP (tylko jako flag pomocniczy, NIE jako samodzielny finding) ---
+    # Timestampy plików SPP zmieniają się przy każdej legalnej operacji systemowej.
+    # Te dane NIE SĄ dowodem — służą wyłącznie do korelacji z twardymi sygnałami
+    # (GenuineTicket.xml, PowerShell log, ślady forensyczne).
+    $sppTimelineSuspicious = $false
 
-    # Check 2: tokens.dat zmodyfikowany podczas trwającej sesji (bez rebootu) -> silny sygnał HWID
-    # Ten check jest niezależny od upgrade'ów — modyfikacja SPP w trakcie sesji zawsze podejrzana
+    if ($daysAfterInstall -gt 365 -and -not $legitimateReason) {
+        # >365 dni bez wyjaśnienia: słaby sygnał, tylko do korelacji
+        $sppTimelineSuspicious = $true
+    }
+
+    # Check 2: tokens.dat zmodyfikowany podczas trwającej sesji (bez rebootu)
+    # Modyfikacja SPP w trakcie sesji jest nietypowa, ale nadal możliwa legalnie
+    # (naprawa sppsvc, instalacja roli/feature). Traktowane jako sygnał orientacyjny.
     $hoursSinceTokenMod = [math]::Round(((Get-Date) - $tokensModDate).TotalHours, 2)
     if ($hoursSinceTokenMod -lt 48 -and $lastBootTime) {
         $uptimeHours = [math]::Round(((Get-Date) - $lastBootTime).TotalHours, 2)
         if ($uptimeHours -gt 48 -and $hoursSinceTokenMod -lt $uptimeHours) {
-            Add-Finding -Id "SPP_TOKENS_MOD_MID_SESSION" -Severity "High" -Area "MAS HWID" `
-                -Evidence "tokens.dat zmodyfikowany $hoursSinceTokenMod godzin(y) temu podczas gdy system działa od $uptimeHours godzin. Modyfikacja SPP store bez restartu to silny wskaźnik aktywacji HWID/TSforge." `
-                -Recommendation "Wymagane natychmiastowe sprawdzenie. Uruchom slmgr /dlv i porównaj ze znanym-dobrym stanem."
+            Add-Finding -Id "SPP_TOKENS_MOD_MID_SESSION" -Severity "Medium" -Area "MAS HWID" `
+                -Evidence "tokens.dat zmodyfikowany $hoursSinceTokenMod godzin(y) temu, system działa od $uptimeHours godzin. Modyfikacja SPP w trakcie sesji (bez rebootu) — może być skutkiem ubocznym legalnych operacji (naprawa sppsvc, Windows Update), ale też charakterystyczna dla aktywacji HWID/TSforge." `
+                -Recommendation "Słaby sygnał — NIE jest dowodem aktywacji. Skoreluj z twardymi wskaźnikami: GenuineTicket.xml, wpisy w PowerShell log, ślady plików aktywatorów."
+            $sppTimelineSuspicious = $true
         }
     }
 }
 
-# Check 3: data.dat — również dotykany przez HWID. Synchronizacja modyfikacji z tokens.dat
+# Check 3: data.dat — synchronizacja modyfikacji z tokens.dat (tylko jako flag pomocniczy)
 $dataDat = $sppStoreFiles | Where-Object { $_.Name -eq "data.dat" } | Select-Object -First 1
 if ($dataDat -and $tokensDat) {
     $timeDiff = [math]::Abs(($dataDat.LastWriteTime - $tokensDat.LastWriteTime).TotalSeconds)
     if ($timeDiff -le 5) {
         $daysSinceMod = [math]::Round(((Get-Date) - $tokensDat.LastWriteTime).TotalDays, 0)
         if ($daysSinceMod -lt 30) {
-            Add-Finding -Id "SPP_STORE_SYNC_MOD" -Severity "Medium" -Area "MAS HWID" `
-                -Evidence "data.dat i tokens.dat zmodyfikowane w odstępie $timeDiff sekund ($($tokensDat.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))). Synchronizowana modyfikacja SPP store jest charakterystyczna dla wstrzyknięcia biletu HWID." `
-                -Recommendation "Skoreluj czas modyfikacji ze znanymi zdarzeniami systemowymi (aktualizacje, upgrade). Zbadaj niewyjaśnione synchroniczne modyfikacje SPP."
+            $sppTimelineSuspicious = $true
         }
     }
 }
@@ -741,16 +739,14 @@ if ($retailWinLic.Count -gt 0 -and [string]::IsNullOrWhiteSpace($oemKey)) {
         -Recommendation "Jeśli to urządzenie konsumenckie (laptop/fabryczny PC), brak klucza OEM przy licencji Retail jest anomalią. Zweryfikuj źródło licencji."
 }
 
-# Check 7: cache.dat — również część SPP store, sprawdź spójność czasową
+# Check 7: cache.dat — spójność czasowa z tokens.dat (tylko jako flag pomocniczy)
 $cacheDat = $sppStoreFiles | Where-Object { $_.Name -eq "cache.dat" } | Select-Object -First 1
 if ($cacheDat -and $tokensDat) {
     $cacheTokenDiff = [math]::Abs(($cacheDat.LastWriteTime - $tokensDat.LastWriteTime).TotalSeconds)
     if ($cacheTokenDiff -le 10) {
         $daysSinceCache = [math]::Round(((Get-Date) - $cacheDat.LastWriteTime).TotalDays, 0)
         if ($daysSinceCache -lt 30) {
-            Add-Finding -Id "SPP_CACHE_SYNC_MOD" -Severity "Medium" -Area "MAS HWID" `
-                -Evidence "cache.dat i tokens.dat zmodyfikowane w odstępie $cacheTokenDiff sekund ($($cacheDat.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))). Pełen SPP store został dotknięty w krótkim oknie czasowym." `
-                -Recommendation "Modyfikacja całego zestawu plików SPP (tokens + data + cache) w jednym momencie jest silnie podejrzana. Skoreluj z harmonogramem aktualizacji."
+            $sppTimelineSuspicious = $true
         }
     }
 }
@@ -1118,6 +1114,7 @@ if ($forensicTrace -and $kmsAnomaly) {
 # RULE 5: GenuineTicket.xml found → hard signal of HWID activation
 # ClipSVC normally cleans up GenuineTicket.xml after processing. A leftover
 # means the ticket was injected manually (HWID method) or cleanup failed.
+# This is the SINGLE STRONGEST indicator of HWID activation.
 $genuineTicketFinding = $findings | Where-Object { $_.Id -eq "HWID_GENUINE_TICKET" }
 if ($genuineTicketFinding) {
     Add-Finding -Id "CORR_HWID_GENUINE_TICKET" -Severity "Critical" -Area "Correlation" `
@@ -1125,55 +1122,57 @@ if ($genuineTicketFinding) {
         -Recommendation "Near-certain HWID activation detected. Remove the ticket file and investigate activation history."
 }
 
-# RULE 6: SPP tokens modified mid-session + Retail channel without OEM key → HWID activation
-# Two independent HWID signals: (1) SPP store touched during uptime without reboot,
-# (2) Retail-licensed Windows on a machine with no OEM firmware key.
+# RULE 6: SPP mid-session modification + Retail channel without OEM key → orientacyjny sygnał HWID
+# Oba sygnały są SŁABE indywidualnie — timestamp SPP zmienia się przy wielu legalnych
+# operacjach, a brak klucza OEM jest normalny na PC składanych ręcznie. Razem dają
+# orientacyjną wskazówkę, NIE dowód.
 $sppMidSession = $findings | Where-Object { $_.Id -eq "SPP_TOKENS_MOD_MID_SESSION" }
 $retailNoOem  = $findings | Where-Object { $_.Id -eq "HWID_RETAIL_NO_OEM_KEY" }
 if ($sppMidSession -and $retailNoOem) {
-    Add-Finding -Id "CORR_HWID_SPP_AND_RETAIL" -Severity "Critical" -Area "Correlation" `
-        -Evidence "SPP token store modified mid-session ($($sppMidSession.Evidence)) combined with Retail channel and no OEM key ($($retailNoOem.Evidence)). Both signals independently point to HWID activation." `
-        -Recommendation "High-confidence HWID activation detected. Remove unauthorized activation and acquire legitimate Windows license."
+    Add-Finding -Id "CORR_HWID_SPP_AND_RETAIL" -Severity "High" -Area "Correlation" `
+        -Evidence "Modyfikacja SPP w trakcie sesji + Retail bez klucza OEM. Dwa niezależne, ale SŁABE sygnały — orientacyjna wskazówka, nie dowód HWID." `
+        -Recommendation "Skoreluj z TWARDYMI dowodami: GenuineTicket.xml, wpisy PowerShell log, ślady plików aktywatorów. Same timestampy i kanał Retail NIE wystarczają do potwierdzenia."
 }
 
-# RULE 7: SPP store modification + forensic traces of activator → consistent picture
-$sppModFinding = $findings | Where-Object { $_.Id -in @("SPP_TOKENS_MOD_MID_SESSION", "SPP_STORE_SYNC_MOD", "SPP_TOKENS_MODIFIED_AFTER_INSTALL", "SPP_CACHE_SYNC_MOD") }
-if ($forensicTrace -and $sppModFinding) {
+# RULE 7: Twarde ślady forensyczne + anomalia osi czasu SPP → spójny obraz
+# Łączy MOCNE dowody (PowerShell log, Recycle Bin, Security audit, Prefetch)
+# ze SŁABYM sygnałem timestamp SPP. Daje to wysoki poziom pewności.
+if ($forensicTrace -and $sppTimelineSuspicious) {
     Add-Finding -Id "CORR_HWID_FORENSIC_MATCH" -Severity "Critical" -Area "Correlation" `
-        -Evidence "Forensic traces of activator execution ($($forensicTrace[0].Evidence)) combined with SPP store modification ($($sppModFinding[0].Evidence)). Both historical and current indicators confirm unauthorized activation." `
-        -Recommendation "Past and present evidence both point to HWID/TSforge activation. Full licensing remediation required."
+        -Evidence "Twarde ślady forensyczne aktywatora ($($forensicTrace[0].Evidence)) + anomalia osi czasu SPP. Dowody historyczne i stan obecny tworzą spójny obraz." `
+        -Recommendation "Połączenie śladów wykonania aktywatora z anomalią SPP daje wysoką pewność. Przeprowadź pełną remediację licencjonowania."
 }
 
-# RULE 8: TSforge DLL + any SPP modification → active TSforge installation
+# RULE 8: TSforge DLL + anomalia osi czasu SPP → aktywne TSforge
 $tsforgeFileFinding = $findings | Where-Object { $_.Id -eq "TSFORGE_FILE_PRESENT" }
-if ($tsforgeFileFinding -and $sppModFinding) {
+if ($tsforgeFileFinding -and $sppTimelineSuspicious) {
     Add-Finding -Id "CORR_TSFORGE_ACTIVE" -Severity "Critical" -Area "Correlation" `
-        -Evidence "TSforge hook DLL present ($($tsforgeFileFinding.Evidence)) combined with SPP store modification ($($sppModFinding[0].Evidence)). Both artefacts of TSforge activation detected simultaneously." `
-        -Recommendation "High-confidence TSforge activation detected. Remove hook DLLs and SPP modifications, then reactivate Windows legitimately."
+        -Evidence "DLL hook TSforge ($($tsforgeFileFinding.Evidence)) + anomalia osi czasu SPP. Oba artefakty aktywacji TSforge wykryte jednocześnie." `
+        -Recommendation "Wysoka pewność aktywacji TSforge. Usuń DLL hooki i zweryfikuj aktywację Windows przez legalny kanał."
 }
 
-# RULE 9: SPP store ACL relaxed + SPP store modification → active tampering with file system
+# RULE 9: SPP ACL relaxed + anomalia osi czasu SPP → naruszenie integralności
 $sppAclHit = $findings | Where-Object { $_.Id -in @("SPP_STORE_ACL_RELAXED", "SPP_FILE_ACL_RELAXED") }
-if ($sppAclHit -and $sppModFinding) {
+if ($sppAclHit -and $sppTimelineSuspicious) {
     Add-Finding -Id "CORR_SPP_ACL_TAMPER" -Severity "Critical" -Area "Correlation" `
-        -Evidence "SPP store ACL relaxed ($($sppAclHit[0].Evidence)) combined with SPP store modification ($($sppModFinding[0].Evidence)). File system permissions were changed to enable unauthorized activation." `
-        -Recommendation "Restore default NTFS ACL on SPP store directory and files, then validate activation state through official channels."
+        -Evidence "Uprawnienia SPP store zmienione ($($sppAclHit[0].Evidence)) + anomalia osi czasu SPP. Uprawnienia systemu plików zostały zmienione by umożliwić nieautoryzowaną aktywację." `
+        -Recommendation "Przywróć domyślne ACL na katalogu i plikach SPP store, następnie zweryfikuj stan aktywacji przez oficjalne kanały."
 }
 
-# RULE 10: SPP file ADS present + SPP store modification → stealth tampering
+# RULE 10: SPP ADS + anomalia osi czasu SPP → ukryte dane aktywatora
 $sppAdsHit = $findings | Where-Object { $_.Id -eq "SPP_FILE_ADS_PRESENT" }
-if ($sppAdsHit -and $sppModFinding) {
+if ($sppAdsHit -and $sppTimelineSuspicious) {
     Add-Finding -Id "CORR_SPP_ADS_TAMPER" -Severity "Critical" -Area "Correlation" `
-        -Evidence "Alternate Data Stream on SPP store file ($($sppAdsHit.Evidence)) combined with SPP store modification ($($sppModFinding[0].Evidence)). ADS is a known technique for hiding activator payloads." `
-        -Recommendation "Investigate ADS content on SPP files (Get-Content -Stream) and remove unauthorized streams. Validate activation state."
+        -Evidence "Alternate Data Stream na pliku SPP ($($sppAdsHit.Evidence)) + anomalia osi czasu SPP. ADS to znana technika ukrywania ładunków aktywatorów." `
+        -Recommendation "Zbadaj zawartość ADS na plikach SPP (Get-Content -Stream) i usuń nieautoryzowane strumienie. Zweryfikuj stan aktywacji."
 }
 
-# RULE 11: SPP binary invalid signature + SPP store modification → binary replacement + activation tampering
+# RULE 11: SPP binary invalid signature + anomalia osi czasu SPP → podmiana binariów
 $sppSigHit = $findings | Where-Object { $_.Id -in @("SPP_BINARY_INVALID_SIGNATURE", "SPP_BINARY_UNEXPECTED_SIGNER") }
-if ($sppSigHit -and $sppModFinding) {
+if ($sppSigHit -and $sppTimelineSuspicious) {
     Add-Finding -Id "CORR_SPP_BINARY_TAMPER" -Severity "Critical" -Area "Correlation" `
-        -Evidence "SPP binary with invalid/unexpected signature ($($sppSigHit[0].Evidence)) combined with SPP store modification ($($sppModFinding[0].Evidence)). Binary replacement and store tampering detected together." `
-        -Recommendation "Replace tampered SPP binaries from known-good Windows media and re-validate activation. Escalate for forensic investigation."
+        -Evidence "Podpis binarny SPP nieprawidłowy ($($sppSigHit[0].Evidence)) + anomalia osi czasu SPP. Podmiana plików binarnych i naruszenie store wykryte razem." `
+        -Recommendation "Zastąp naruszone pliki binarne SPP z czystego nośnika Windows i ponownie zweryfikuj aktywację. Eskalij do analizy forensiczej."
 }
 
 # --- End Correlation Rule Engine ---
