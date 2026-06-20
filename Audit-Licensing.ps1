@@ -862,10 +862,25 @@ foreach ($sppGlob in $sppBinaryGlobs) {
 }
 
 # --- Forensic Traces: detect deleted or previously-run activator tools ---
+# UWAGA OGRANICZENIA:
+# - Prefetch: tylko EXE (MAS .ps1/.cmd NIE tworzy wpisow). Regex lapa tylko
+#   niezmienione nazwy plikow — trywialne do obejscia przez rename.
+# - PowerShell log: przechwytuje wykonane skrypty przez Event ID 4103/4104.
+#   Skuteczniejszy niz Prefetch, ale nadal omijalny przez obfuskacje.
+# - Recycle Bin: wiekszosc aktywatorow uruchamia sie z uprawnieniami SYSTEM
+#   i self-destruct przez Shift+Delete / del — NIE trafiaja do kosza.
+# - Security log (4660): jedyne zrodlo wykrywajace Shift+Delete, ale wymaga
+#   Audit File System wlaczonego w secpol.msc (domyslnie wylaczone na client SKU).
+# - AMSI/Defender (ponizej): najlepsza metoda — przechwytuje tresc skryptu
+#   niezaleznie od nazwy pliku. Wymaga dzialajacego Windows Defender.
+#
+# WNIOSEK: Te checki NIE sa wyczerpujace. Wykrywaja tylko slady pozostawione
+# przez nieostroznych uzytkownikow lub stare/naiwne aktywatory.
 
 # Prefetch files survive EXE deletion and record execution time.
-# Note: MAS itself runs as .ps1/.cmd so it does NOT create prefetch entries,
-# but EXE-based companions (KMSPico, KMSAuto, AAct, AutoKMS) do.
+# LIMITATIONS: Only EXE files (MAS .ps1/.cmd does NOT create Prefetch).
+# Regex matches only well-known unchanged filenames — trivially bypassed by renaming.
+# Detects only the clumsiest users and oldest activator EXE wrappers.
 $prefetchPath = "$env:SystemRoot\Prefetch"
 $prefetchIndicatorRegex = '(?i)^(autokms|kmsauto|kms_?auto|kmspico|aact(64)?|heu_kms|kms_vl_all|vlmcsd|kmseldi|km_service)'
 if (Test-Path -Path $prefetchPath) {
@@ -885,10 +900,11 @@ if (Test-Path -Path $prefetchPath) {
     }
 }
 
-# PowerShell event logs (4103/4104): MAS runs as .ps1/.cmd, so it leaves NO
-# Prefetch entries. But PowerShell Operational log captures executed script
-# blocks and pipeline details — surviving script file deletion.
-$psIndicatorRegex = '(?i)(Microsoft\.Activation\.Scripts|Activation-Renewal|Online_KMS|HWID_Activation|TSforge|MAS_AllInOne|\bohook\b|\bkmsauto\b|\bkmspico\b|\bheu_kms\b|\bvlmcsd\b|\bAAct\b)'
+# PowerShell event logs (4103/4104): przechwytuje wykonane bloki skryptu.
+# Lepiej niz Prefetch, bo dziala niezaleznie od nazwy pliku. Nadal omijalny
+# przez obfuskacje, ale lapanie wzorcow BEHAWIORALNYCH (slmgr, ClipSVC, SPP)
+# zamiast tylko nazw aktywatorow daje szersze pokrycie.
+$psIndicatorRegex = '(?i)(Microsoft\.Activation\.Scripts|Activation-Renewal|Online_KMS|HWID_Activation|TSforge|MAS_AllInOne|\bohook\b|\bkmsauto\b|\bkmspico\b|\bheu_kms\b|\bvlmcsd\b|\bAAct\b|slmgr\s.*\/ipk|slmgr\s.*\/upk|ClipSVC|GenuineTicket|SoftwareLicensingProduct|SppExtComObj|tokens\.dat|\bHWID\b|TSforge\b|\bKMS38\b|sppsvc|osppsvc|spp\.dll|sppc\.dll|hook\.dll)'
 try {
     $psOpLog = "Microsoft-Windows-PowerShell/Operational"
     if (Get-WinEvent -ListLog $psOpLog -ErrorAction SilentlyContinue) {
@@ -907,8 +923,8 @@ try {
             $snippet  = ($evt.Message.Substring($ctxStart, $ctxLen) -replace '\s+', ' ').Trim()
 
             Add-Finding -Id "POWERSHELL_LOG_ACTIVATOR" -Severity "High" -Area "Forensic Traces" `
-                -Evidence "PowerShell event ID $($evt.Id) contains activator keyword. TimeCreated: $($evt.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | Context: ...$snippet..." `
-                -Recommendation "PowerShell operational log captured MAS/activator script execution. Correlate timestamp with activation events and user session activity."
+                -Evidence "PowerShell event ID $($evt.Id) zawiera wzorzec aktywatora (marka lub zachowanie: slmgr/ClipSVC/SPP). TimeCreated: $($evt.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | Kontekst: ...$snippet..." `
+                -Recommendation "PowerShell operational log przechwycil wykonanie skryptu aktywatora lub manipulacji SPP. Skoreluj timestamp ze zdarzeniami aktywacji i sesja uzytkownika."
         }
     }
 }
@@ -918,11 +934,41 @@ catch {
         -Recommendation "Verify the PowerShell Operational log is enabled and the script runs as Administrator."
 }
 
+# AMSI / Windows Defender log: NAJLEPSZA metoda wykrywania skryptow aktywatorow.
+# AMSI skanuje TRESC skryptu w runtime — niezaleznie od nazwy pliku, obfuskacji
+# czy metody uruchomienia. Event ID 1116 (wykrycie) i 1117 (akcja) w dzienniku
+# Windows Defender Operational przechwytuja to, co pominely pozostale checki.
+# Wymaga dzialajacego Windows Defender (domyslnie wlaczony na client SKU).
+$amsiIndicatorRegex = '(?i)(hacktool|activator|kms|ohook|hwid|tsforge|autokms|kmspico|aact|vlmcsd|sppc|malware|trojan)'
+try {
+    $defenderLog = "Microsoft-Windows-Windows Defender/Operational"
+    if (Get-WinEvent -ListLog $defenderLog -ErrorAction SilentlyContinue) {
+        $amsiEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = $defenderLog
+            ID        = 1116, 1117
+            StartTime = (Get-Date).AddDays(-90)
+        } -MaxEvents 2000 -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match $amsiIndicatorRegex }
+
+        foreach ($evt in $amsiEvents) {
+            # AMSI events zawieraja nazwe wykrytego zagrozenia w Message
+            $threatName = if ($evt.Message -match 'Threat Name:\s*(.+?)(\r|\n|$)') { $Matches[1].Trim() } else { "(unknown)" }
+            Add-Finding -Id "AMSI_ACTIVATOR_DETECTION" -Severity "High" -Area "Forensic Traces" `
+                -Evidence "AMSI/Defender Event ID $($evt.Id): wykryto zagrozenie '$threatName'. TimeCreated: $($evt.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))" `
+                -Recommendation "AMSI wykrylo skrypt aktywatora po TRESCI, nie nazwie pliku — to NAJMOCNIEJSZY sygnal w tej sekcji. Sprawdz pelna sciezke pliku i historie w Event Logu Defender."
+        }
+    }
+}
+catch {
+    # Defender log niedostepny — moze byc wylaczony lub skrypt bez uprawnien.
+    # Nie tworzymy findingu — brak logu nie jest anomalia.
+}
+
 # Recycle Bin: $I metadata files contain original path of deleted items (Windows Vista+).
 # Binary format (v2, Windows 10): [8 version][8 size][8 FILETIME][4 pathLen][pathLen*2 Unicode path]
 # Checked on ALL fixed drives (not just C:), since users may have deleted activator files from any volume.
-# LIMITATION: Shift+Delete bypasses Recycle Bin entirely. For those cases, the Security
-# event log (Event ID 4660) and VSS shadow copies are checked below.
+# LIMITATION: Most activators run as SYSTEM and self-destruct via Shift+Delete / del,
+# completely bypassing the Recycle Bin. This check catches only clumsy manual deletions.
 $activatorPathRegex = '(?i)(autokms|kmsauto|kmspico|kms_vl_all|aact|ohook|sppcs\.dll|activation.renewal|mas_|heu_kms|vlmcsd)'
 
 # Enumerate all fixed drives (type 3) for Recycle Bin search.
@@ -949,8 +995,8 @@ foreach ($drive in $fixedDrives) {
                             if ($originalPath -match $activatorPathRegex) {
                                 $deletedAt = [DateTime]::FromFileTime([BitConverter]::ToInt64($bytes, 16)).ToString('yyyy-MM-dd HH:mm:ss')
                                 Add-Finding -Id "RECYCLEBIN_ACTIVATOR" -Severity "Medium" -Area "Forensic Traces" `
-                                    -Evidence "Deleted activator file found in Recycle Bin ($($drive.DeviceID)): '$originalPath' | Deleted: $deletedAt" `
-                                    -Recommendation "File was deleted but its presence indicates prior activator use. Validate current license state."
+                                    -Evidence "Usuniety plik aktywatora w Koszu ($($drive.DeviceID)): '$originalPath' | Usuniety: $deletedAt. UWAGA: wiekszosc aktywatorow omija Kosz przez Shift+Delete — ten slad zostawil tylko nieostrozny uzytkownik." `
+                                    -Recommendation "Plik zostal usuniety, ale trafil do Kosza (nietypowe dla aktywatorow SYSTEM). Zweryfikuj obecny stan licencji — aktywator mogl dzialac przed usunieciem."
                             }
                         }
                     }
@@ -961,8 +1007,8 @@ foreach ($drive in $fixedDrives) {
                             if ($originalPath -match $activatorPathRegex) {
                                 $deletedAt = [DateTime]::FromFileTime([BitConverter]::ToInt64($bytes, 16)).ToString('yyyy-MM-dd HH:mm:ss')
                                 Add-Finding -Id "RECYCLEBIN_ACTIVATOR" -Severity "Medium" -Area "Forensic Traces" `
-                                    -Evidence "Deleted activator file found in Recycle Bin ($($drive.DeviceID)): '$originalPath' | Deleted: $deletedAt" `
-                                    -Recommendation "File was deleted but its presence indicates prior activator use. Validate current license state."
+                                    -Evidence "Usuniety plik aktywatora w Koszu ($($drive.DeviceID)): '$originalPath' | Usuniety: $deletedAt. UWAGA: wiekszosc aktywatorow omija Kosz przez Shift+Delete — ten slad zostawil tylko nieostrozny uzytkownik." `
+                                    -Recommendation "Plik zostal usuniety, ale trafil do Kosza (nietypowe dla aktywatorow SYSTEM). Zweryfikuj obecny stan licencji — aktywator mogl dzialac przed usunieciem."
                             }
                         }
                     }
@@ -1108,7 +1154,7 @@ if ($kmsLocalhost) {
 }
 
 # RULE 4: Forensic activator trace + current KMS anomaly → consistent picture of past+present manipulation
-$forensicTrace = $findings | Where-Object { $_.Id -in @("PREFETCH_ACTIVATOR", "RECYCLEBIN_ACTIVATOR", "POWERSHELL_LOG_ACTIVATOR", "SECLOG_DELETION_AUDIT") }
+$forensicTrace = $findings | Where-Object { $_.Id -in @("PREFETCH_ACTIVATOR", "RECYCLEBIN_ACTIVATOR", "POWERSHELL_LOG_ACTIVATOR", "SECLOG_DELETION_AUDIT", "AMSI_ACTIVATOR_DETECTION") }
 $kmsAnomaly    = $findings | Where-Object { $_.Id -in @("KMS_LOCALHOST", "KMS_CUSTOM_HOST", "MAS_ONLINE_KMS_DIR", "MAS_ONLINE_KMS_TASK", "OHOOK_FILE_PRESENT", "MAS_OHOOK_REGISTRY") }
 if ($forensicTrace -and $kmsAnomaly) {
     Add-Finding -Id "CORR_FORENSIC_MATCH" -Severity "Critical" -Area "Correlation" `
