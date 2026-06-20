@@ -198,7 +198,7 @@ foreach ($uPath in $uninstallPaths) {
                     RegistrySource = $uPath
                 })
             }
-        } catch { }
+        } catch { Write-Debug "Office registry read skipped: $($_.Exception.Message)" }
     }
 }
 
@@ -221,7 +221,7 @@ if (Test-Path -Path $vNextLicensePath) {
         $authFiles = Get-ChildItem -Path $vNextLicensePath -Filter "*.auth" -ErrorAction Stop
         $hasVNextTokens = ($authFiles.Count -gt 0)
     }
-    catch { }
+    catch { Write-Debug "vNext licensing token check failed: $($_.Exception.Message)" }
 }
 
 $subscriptionEntries = @($officeSummary | Where-Object { $_.Description -match "TIMEBASED_SUB|SUB" -or $_.Name -match "O365|Microsoft 365|Subscription" })
@@ -249,6 +249,7 @@ if (Test-Path -Path $officeIdentityPath) {
                     }
                 }
                 catch {
+                    Write-Debug "Office identity profile key skipped: $($_.Exception.Message)"
                     # Continue with other identities if one profile key cannot be read.
                 }
             }
@@ -413,6 +414,7 @@ try {
     }
 }
 catch {
+    Write-Debug "Activation-Renewal task query failed: $($_.Exception.Message)"
     # Non-critical: task query failure is handled by the main scheduled task check below.
 }
 
@@ -572,7 +574,12 @@ try {
     $windowsInstallDate = $osInfo.InstallDate
     $lastBootTime = $osInfo.LastBootUpTime
 }
-catch { }
+catch {
+    Write-Debug "Win32_OperatingSystem CIM query failed: $($_.Exception.Message)"
+    Add-Finding -Id "OS_INFO_READ_ERROR" -Severity "Medium" -Area "System" `
+        -Evidence "Nie można odczytać informacji o systemie operacyjnym (Win32_OperatingSystem): $($_.Exception.Message)" `
+        -Recommendation "Sprawdź stan usługi CIM/WMI. Bez daty instalacji i uptime'u detekcja osi czasu SPP będzie ograniczona."
+}
 
 # --- Kontekst pomocniczy: upgrade Windows i instalacja Office ---
 # Te dane pozwalają odróżnić naturalne modyfikacje SPP od wstrzyknięcia HWID.
@@ -587,10 +594,10 @@ try {
     $sourceOsUpdated = Get-ItemProperty -Path $setupKey -Name "Source OS (Updated on)" -ErrorAction SilentlyContinue
     if ($sourceOsUpdated -and $sourceOsUpdated.'Source OS (Updated on)') {
         $rawDate = $sourceOsUpdated.'Source OS (Updated on)'
-        try { $windowsUpgradeDate = Get-Date -Date $rawDate -ErrorAction Stop; $isWindowsUpgraded = $true } catch { }
+        try { $windowsUpgradeDate = Get-Date -Date $rawDate -ErrorAction Stop; $isWindowsUpgraded = $true } catch { Write-Debug "Source OS date parse failed: $($_.Exception.Message)" }
     }
 }
-catch { }
+catch { Write-Debug "Source OS upgrade detection skipped: $($_.Exception.Message)" }
 
 # Druga ścieżka: MoSetup (Modern Setup) używany przy upgrade przez Windows Update
 if (-not $isWindowsUpgraded) {
@@ -600,7 +607,7 @@ if (-not $isWindowsUpgraded) {
             $isWindowsUpgraded = $true
         }
     }
-    catch { }
+    catch { Write-Debug "MoSetup upgrade detection skipped: $($_.Exception.Message)" }
 }
 
 # Data ostatniej instalacji Office — do korelacji z datą modyfikacji SPP
@@ -645,7 +652,7 @@ if ($tokensDat -and $windowsInstallDate) {
                 $legitimateReason = "prawdopodobny upgrade do Windows 11 (build $currentBuild, oryginalna instalacja $($windowsInstallDate.ToString('yyyy-MM')))"
             }
         }
-        catch { }
+        catch { Write-Debug "BuildNumber cast failed: $($_.Exception.Message)" }
     }
 
     # --- Ocena trójstopniowa ---
@@ -805,6 +812,7 @@ foreach ($sppFile in $sppKeyFiles) {
         }
     }
     catch {
+        Write-Debug "SPP file ACL read failed: $($_.Exception.Message)"
         # Błąd odczytu ACL na pojedynczym pliku — niekrytyczny.
     }
 }
@@ -822,6 +830,7 @@ foreach ($sppFile in $sppKeyFiles) {
         }
     }
     catch {
+        Write-Debug "SPP file ADS check failed: $($_.Exception.Message)"
         # Błąd odczytu ADS — niekrytyczny (może wystąpić na wolumenach nienależących do NTFS).
     }
 }
@@ -856,6 +865,7 @@ foreach ($sppGlob in $sppBinaryGlobs) {
             }
         }
         catch {
+            Write-Debug "SPP binary signature check failed: $($_.Exception.Message)"
             # Błąd odczytu podpisu pojedynczego pliku — niekrytyczny.
         }
     }
@@ -960,6 +970,7 @@ try {
     }
 }
 catch {
+    Write-Debug "AMSI/Defender log query failed: $($_.Exception.Message)"
     # Defender log niedostepny — moze byc wylaczony lub skrypt bez uprawnien.
     # Nie tworzymy findingu — brak logu nie jest anomalia.
 }
@@ -1015,6 +1026,7 @@ foreach ($drive in $fixedDrives) {
                 }
             }
             catch {
+                Write-Debug "Recycle Bin metadata file skipped: $($_.Exception.Message)"
                 # Skip unreadable $I files (locked or corrupt).
             }
         }
@@ -1051,12 +1063,14 @@ try {
                 }
             }
             catch {
+                Write-Debug "Security event XML parse failed: $($_.Exception.Message)"
                 # Skip unparseable events.
             }
         }
     }
 }
 catch {
+    Write-Debug "Security log query failed: $($_.Exception.Message)"
     # Security log may be inaccessible even as Administrator (requires SeSecurityPrivilege).
     # Expected on most consumer machines — not an error worth surfacing.
 }
@@ -1075,6 +1089,7 @@ try {
     }
 }
 catch {
+    Write-Debug "VSS shadow copy query failed: $($_.Exception.Message)"
     # VSS may be disabled or inaccessible. Not an error — just no shadow copies to check.
 }
 
