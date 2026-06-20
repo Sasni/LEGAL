@@ -11,3 +11,6 @@ findings.txt
 # Temporary/local run artifacts
 Audit-Licensing-Temp.ps1
 *.log
+
+# Activator samples — badane i wykrywane, nie do publikacji
+MAS_AIO.cmd
