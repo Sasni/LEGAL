@@ -307,7 +307,6 @@ if (Test-Path -Path $officeIdentityPath) {
                 }
                 catch {
                     Write-Debug "Office identity profile key skipped: $($_.Exception.Message)"
-                    # Continue with other identities if one profile key cannot be read.
                 }
             }
         }
@@ -357,6 +356,77 @@ if (Test-Path -Path $officeIdentityPath) {
         Add-Finding -Id "OFFICE365_IDENTITY_READ_ERROR" -Severity "Low" -Area "Office 365" `
             -Evidence "Could not read HKCU Office identity data: $($_.Exception.Message)$hkcErrorCtx" `
             -Recommendation "Run in user context with loaded profile to audit Microsoft 365 sign-in state."
+    }
+}
+
+# If Identity key was empty, try alternative sign-in locations
+if (-not $office365Identity -or -not $office365Identity.IsOffice365Account) {
+    $altIdentity = $null
+    $altSource = ""
+
+    # Check 1: HKCU\...\SignIn (Office sign-in cache)
+    $signInPath = "HKCU:\Software\Microsoft\Office\16.0\Common\SignIn"
+    if (Test-Path $signInPath) {
+        try {
+            $signIn = Get-ItemProperty -Path $signInPath -ErrorAction Stop
+            if ($signIn.SignInName) {
+                $altIdentity = $signIn.SignInName
+                $altSource = "SignIn key"
+            } elseif ($signIn.LastUsedUserId) {
+                $altIdentity = $signIn.LastUsedUserId
+                $altSource = "SignIn key (LastUsedUserId)"
+            }
+        } catch {}
+    }
+
+    # Check 2: Office Registration subkeys
+    if (-not $altIdentity) {
+        $regPath = "HKCU:\Software\Microsoft\Office\16.0\Registration"
+        if (Test-Path $regPath) {
+            try {
+                $regKeys = Get-ChildItem -Path $regPath -ErrorAction SilentlyContinue
+                foreach ($rk in $regKeys) {
+                    $rp = Get-ItemProperty -Path $rk.PSPath -ErrorAction SilentlyContinue
+                    if ($rp.UserEmail) {
+                        $altIdentity = $rp.UserEmail
+                        $altSource = "Registration key"
+                        break
+                    }
+                }
+            } catch {}
+        }
+    }
+
+    # Check 3: HKCU\...\Common\Licensing (vNext tokens)
+    if (-not $altIdentity) {
+        $licPath = "HKCU:\Software\Microsoft\Office\16.0\Common\Licensing"
+        if (Test-Path $licPath) {
+            try {
+                $licProps = Get-ItemProperty -Path $licPath -ErrorAction Stop
+                if ($licProps.LicensingEmailAddress) {
+                    $altIdentity = $licProps.LicensingEmailAddress
+                    $altSource = "Licensing key"
+                }
+            } catch {}
+        }
+    }
+
+    if ($altIdentity) {
+        $office365Identity = [pscustomobject]@{
+            IdentityPath        = $altSource
+            SignInName          = $altIdentity
+            UserName            = ""
+            UserEmail           = ""
+            FederatedUserEmail  = ""
+            TenantId            = ""
+            ProfileCount        = 0
+            Profiles            = @()
+            DetectedIdentities  = @($altIdentity)
+            IsOffice365Account  = $true
+        }
+        Add-Finding -Id "OFFICE365_IDENTITY_PRESENT" -Severity "Info" -Area "Office 365" `
+            -Evidence "User identity detected via $altSource: $altIdentity" `
+            -Recommendation "Correlate with assigned Microsoft 365 license in Entra ID / M365 Admin Center."
     }
 }
 
