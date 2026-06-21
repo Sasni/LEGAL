@@ -11,6 +11,17 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 }
 
 $findings = New-Object System.Collections.Generic.List[object]
+$stageStart = Get-Date
+$stageCount = 0
+$stageTotal = 7
+
+function Write-Stage {
+    param([Parameter(Mandatory=$true)][string]$Name)
+    $script:stageCount++
+    $elapsed = [math]::Round(((Get-Date) - $script:stageStart).TotalSeconds, 1)
+    $ts = Get-Date -Format "HH:mm:ss"
+    Write-Host "[$ts] [$stageCount/$stageTotal] $Name" -ForegroundColor Green
+}
 
 function Add-Finding {
     param(
@@ -178,6 +189,8 @@ if ($isRunningAsSystem) {
             -Recommendation "Uruchom skrypt w kontekście zalogowanego użytkownika (RMM: opcja /user), aby sprawdzić tożsamość Office 365 i tokeny vNext."
     }
 }
+
+Write-Stage "Collecting licensing data (CIM/WMI)..."
 
 $windowsAppId = "55c92734-d682-4d71-983e-d6ec3f16059f"
 # Office 2013/2016/2019/2021/2024/Microsoft 365
@@ -462,6 +475,8 @@ foreach ($file in $indicatorFiles) {
     }
 }
 
+Write-Stage "Scanning for activator artifacts (Ohook, KMS, slmgr)..."
+
 # Ohook registry: MAS sets this value to suppress Office 365 license banner.
 $ohookResiliencyPath = "HKCU:\Software\Microsoft\Office\16.0\Common\Licensing\Resiliency"
 $heartbeatVal = Get-RegistryValue -Path $ohookResiliencyPath -Name "TimeOfLastHeartbeatFailure"
@@ -674,6 +689,8 @@ catch {
 }
 
 # --- HWID / TSforge Detection ---
+Write-Stage "Detecting HWID / TSforge activation..."
+
 # HWID (Hardware ID) to najczęściej używana dziś metoda MAS do aktywacji Windows.
 # Używa ClipSVC do wygenerowania biletu podpisanego kryptograficznie przez Microsoft
 # — jest NIEROZRÓŻNIALNY od legalnej licencji cyfrowej na poziomie API i SPP store.
@@ -901,6 +918,8 @@ if ($cacheDat -and $tokensDat) {
 }
 
 # --- SPP Store Integrity Verification ---
+Write-Stage "Verifying SPP Store integrity..."
+
 # Porównanie hashu tokens.dat/data.dat z wzorcem Microsoft nie jest możliwe:
 # zawartość tych plików jest unikalna dla każdej maszyny i zmienia się legalnie
 # przy każdej aktywacji. Bilety HWID wstrzyknięte przez ClipSVC są podpisane
@@ -1009,6 +1028,8 @@ foreach ($sppGlob in $sppBinaryGlobs) {
 }
 
 # --- Forensic Traces: detect deleted or previously-run activator tools ---
+Write-Stage "Collecting forensic traces (Prefetch, PowerShell log, AMSI, VSS)..."
+
 # UWAGA OGRANICZENIA:
 # - Prefetch: tylko EXE (MAS .ps1/.cmd NIE tworzy wpisow). Regex lapa tylko
 #   niezmienione nazwy plikow — trywialne do obejscia przez rename.
@@ -1298,6 +1319,8 @@ catch {
 }
 
 # --- Correlation Rule Engine ---
+Write-Stage "Running correlation rule engine..."
+
 # Runs AFTER all individual checks. Correlates multiple weak signals into
 # high-confidence findings. Does not replace granular findings, only adds to them.
 #
@@ -1426,6 +1449,8 @@ if ($sppSigHit -and $sppTimelineSuspicious) {
 # --- End Correlation Rule Engine ---
 
 $risk = Get-RiskLevel -InputFindings $findings
+
+Write-Stage "Generating report..."
 
 $report = [pscustomobject]@{
     GeneratedAtUtc  = (Get-Date).ToUniversalTime().ToString("s") + "Z"
