@@ -1064,9 +1064,24 @@ catch {
 
 $retailWinLic = @($winSummary | Where-Object { $_.Channel -eq "Retail" -and $_.LicenseStatusText -eq "Licensed" })
 if ($retailWinLic.Count -gt 0 -and [string]::IsNullOrWhiteSpace($oemKey)) {
-    Add-Finding -Id "HWID_RETAIL_NO_OEM_KEY" -Severity "Medium" -Area "MAS HWID" `
-        -Evidence "Windows pokazuje kanał Retail i status Licensed, ale nie znaleziono klucza OEM w firmware (tabela MSDM). Urządzenia konsumenckie normalnie go posiadają." `
-        -Recommendation "Jeśli to urządzenie konsumenckie (laptop/fabryczny PC), brak klucza OEM przy licencji Retail jest anomalią. Zweryfikuj źródło licencji."
+    # Determine if this is a pre-Win8 machine (no MSDM table by design)
+    $biosDate = try { (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).ReleaseDate } catch { $null }
+    $isLegacySystem = $false
+    if ($biosDate) {
+        $biosDt = [DateTime]::ParseExact($biosDate.Substring(0, 8), 'yyyyMMdd', $null)
+        $isLegacySystem = $biosDt -lt (Get-Date '2012-10-26')  # Windows 8 GA date
+    }
+
+    if ($isLegacySystem) {
+        Add-Finding -Id "HWID_RETAIL_NO_OEM_KEY" -Severity "Info" -Area "MAS HWID" `
+            -Evidence "Windows pokazuje kanał Retail i status Licensed, ale nie znaleziono klucza OEM w firmware (tabela MSDM). System pochodzi z ery przed Windows 8 — MSDM nie istniał (BIOS: $biosDate)." `
+            -Recommendation "To NIE jest anomalia. Maszyny z ery Windows 7 (lub starsze) nie mają tabeli MSDM. Uprawnienie cyfrowe (digital entitlement) jest przechowywane na serwerach Microsoft, nie lokalnie."
+    }
+    else {
+        Add-Finding -Id "HWID_RETAIL_NO_OEM_KEY" -Severity "Medium" -Area "MAS HWID" `
+            -Evidence "Windows pokazuje kanał Retail i status Licensed, ale nie znaleziono klucza OEM w firmware (tabela MSDM). Urządzenia konsumenckie normalnie go posiadają." `
+            -Recommendation "Jeśli to urządzenie konsumenckie (laptop/fabryczny PC), brak klucza OEM przy licencji Retail jest anomalią. Zweryfikuj źródło licencji."
+    }
 }
 
 # Check 7: cache.dat — spójność czasowa z tokens.dat (tylko jako flag pomocniczy)
