@@ -928,13 +928,27 @@ Write-Stage "Verifying SPP Store integrity..."
 # ACL, Alternate Data Streams i podpisy cyfrowe binariów SPP.
 
 # Check 8: ACL katalogu SPP store — domyślnie tylko SYSTEM i TrustedInstaller mają zapis
+
+# SID-based check to avoid localization issues (Polish "ZARZĄDZANIE NT\SYSTEM" vs English "NT AUTHORITY\SYSTEM")
+$wellKnownSafeSids = @('S-1-5-18', 'S-1-5-32-544')  # SYSTEM, Administrators
+function Test-IsSafePrincipal {
+    param($IdentityRef)
+    try {
+        $sid = $IdentityRef.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        if ($sid -in $wellKnownSafeSids) { return $true }
+        # TrustedInstaller and any NT SERVICE account (S-1-5-80-*)
+        if ($sid -match '^S-1-5-80-') { return $true }
+        return $false
+    } catch { return $false }
+}
+
 if (Test-Path -Path $sppStorePath) {
     try {
         $sppAcl = Get-Acl -Path $sppStorePath -ErrorAction Stop
         $sppAccess = $sppAcl.Access | Where-Object {
             $_.FileSystemRights -match 'Write|Modify|FullControl|Change' -and
             $_.AccessControlType -eq 'Allow' -and
-            $_.IdentityReference -notmatch '^(NT AUTHORITY\\SYSTEM|NT SERVICE\\TrustedInstaller|BUILTIN\\Administrators)$'
+            -not (Test-IsSafePrincipal $_.IdentityReference)
         }
         if ($sppAccess) {
             $grantedTo = ($sppAccess.IdentityReference | Select-Object -Unique) -join ', '
@@ -958,7 +972,7 @@ foreach ($sppFile in $sppKeyFiles) {
         $fileAccess = $fileAcl.Access | Where-Object {
             $_.FileSystemRights -match 'Write|Modify|FullControl' -and
             $_.AccessControlType -eq 'Allow' -and
-            $_.IdentityReference -notmatch '^(NT AUTHORITY\\SYSTEM|NT SERVICE\\TrustedInstaller|BUILTIN\\Administrators)$'
+            -not (Test-IsSafePrincipal $_.IdentityReference)
         }
         if ($fileAccess) {
             $grantedTo = ($fileAccess.IdentityReference | Select-Object -Unique) -join ', '
