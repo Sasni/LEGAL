@@ -1060,7 +1060,7 @@ try {
             ID        = 4103, 4104
             StartTime = (Get-Date).AddDays(-90)
         } -MaxEvents 5000 -ErrorAction SilentlyContinue |
-            Where-Object { $_.Message -match $psIndicatorRegex }
+            Where-Object { $_.Message -match $psIndicatorRegex -and $_.ProcessId -ne $PID }
 
         foreach ($evt in $psEvents) {
             # Extract a snippet around the match for human-readable evidence
