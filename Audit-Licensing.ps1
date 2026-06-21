@@ -411,6 +411,28 @@ if (-not $office365Identity -or -not $office365Identity.IsOffice365Account) {
         }
     }
 
+    # Check 4: DocToIdMapping — SharePoint personal URLs contain user email
+    if (-not $altIdentity) {
+        $docMapPath = "HKCU:\Software\Microsoft\Office\16.0\Common\Identity\DocToIdMapping"
+        if (Test-Path $docMapPath) {
+            try {
+                $mapKeys = Get-ChildItem -Path $docMapPath -ErrorAction SilentlyContinue
+                foreach ($mk in $mapKeys) {
+                    $mapProps = Get-ItemProperty -Path $mk.PSPath -ErrorAction SilentlyContinue
+                    $mapValues = $mapProps.PSObject.Properties | Where-Object { $_.Name -notin @('PSPath','PSParentPath','PSChildName','PSDrive','PSProvider') } | ForEach-Object { $_.Value }
+                    foreach ($val in $mapValues) {
+                        if ($val -match 'personal/([^/]+)_([^_]+)_([^_]+)_com') {
+                            $altIdentity = "$($Matches[1])@$($Matches[2]).$($Matches[3]).com"
+                            $altSource = "DocToIdMapping (SharePoint URL)"
+                            break
+                        }
+                    }
+                    if ($altIdentity) { break }
+                }
+            } catch {}
+        }
+    }
+
     if ($altIdentity) {
         $office365Identity = [pscustomobject]@{
             IdentityPath        = $altSource
