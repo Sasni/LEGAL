@@ -1049,6 +1049,7 @@ Write-Stage "Collecting forensic traces (Prefetch, PowerShell log, AMSI, VSS)...
 # LIMITATIONS: Only EXE files (MAS .ps1/.cmd does NOT create Prefetch).
 # Regex matches only well-known unchanged filenames — trivially bypassed by renaming.
 # Detects only the clumsiest users and oldest activator EXE wrappers.
+Write-Host "  [*] Scanning Prefetch..." -ForegroundColor DarkGray
 $prefetchPath = "$env:SystemRoot\Prefetch"
 $prefetchIndicatorRegex = '(?i)^(autokms|kmsauto|kms_?auto|kmspico|aact(64)?|heu_kms|kms_vl_all|vlmcsd|kmseldi|km_service)'
 if (Test-Path -Path $prefetchPath) {
@@ -1072,6 +1073,7 @@ if (Test-Path -Path $prefetchPath) {
 # Lepiej niz Prefetch, bo dziala niezaleznie od nazwy pliku. Nadal omijalny
 # przez obfuskacje, ale lapanie wzorcow BEHAWIORALNYCH (slmgr, ClipSVC, SPP)
 # zamiast tylko nazw aktywatorow daje szersze pokrycie.
+Write-Host "  [*] Searching PowerShell Operational log (up to 90 days)... (>najdluzej)" -ForegroundColor DarkGray
 $psIndicatorRegex = '(?i)(Microsoft\.Activation\.Scripts|Activation-Renewal|Online_KMS|HWID_Activation|TSforge|MAS_AllInOne|\bohook\b|\bkmsauto\b|\bkmspico\b|\bheu_kms\b|\bvlmcsd\b|\bAAct\b|slmgr\s.*\/ipk|slmgr\s.*\/upk|ClipSVC|GenuineTicket|SoftwareLicensingProduct|SppExtComObj|tokens\.dat|\bHWID\b|TSforge\b|\bKMS38\b|sppsvc|osppsvc|spp\.dll|sppc\.dll|hook\.dll)'
 try {
     $psOpLog = "Microsoft-Windows-PowerShell/Operational"
@@ -1107,6 +1109,7 @@ catch {
 # czy metody uruchomienia. Event ID 1116 (wykrycie) i 1117 (akcja) w dzienniku
 # Windows Defender Operational przechwytuja to, co pominely pozostale checki.
 # Wymaga dzialajacego Windows Defender (domyslnie wlaczony na client SKU).
+Write-Host "  [*] Searching Defender/AMSI log..." -ForegroundColor DarkGray
 $amsiIndicatorRegex = '(?i)(hacktool|activator|kms|ohook|hwid|tsforge|autokms|kmspico|aact|vlmcsd|sppc|malware|trojan)'
 try {
     $defenderLog = "Microsoft-Windows-Windows Defender/Operational"
@@ -1138,6 +1141,7 @@ catch {
 # Checked on ALL fixed drives (not just C:), since users may have deleted activator files from any volume.
 # LIMITATION: Most activators run as SYSTEM and self-destruct via Shift+Delete / del,
 # completely bypassing the Recycle Bin. This check catches only clumsy manual deletions.
+Write-Host "  [*] Scanning Recycle Bin metadata..." -ForegroundColor DarkGray
 $activatorPathRegex = '(?i)(autokms|kmsauto|kmspico|kms_vl_all|aact|ohook|sppcs\.dll|activation.renewal|mas_|heu_kms|vlmcsd)'
 
 # Enumerate all fixed drives (type 3) for Recycle Bin search.
@@ -1200,6 +1204,7 @@ foreach ($drive in $fixedDrives) {
 # file deletions INCLUDING Shift+Delete (which bypasses Recycle Bin entirely).
 # Requires "Audit File System" or "Audit Object Access" in Local Security Policy
 # (secpol.msc) — NOT enabled by default on client SKUs.
+Write-Host "  [*] Searching Security log (Event 4660)..." -ForegroundColor DarkGray
 try {
     $secLogName = "Security"
     if (Get-WinEvent -ListLog $secLogName -ErrorAction SilentlyContinue) {
@@ -1236,6 +1241,7 @@ catch {
 # VSS (Volume Shadow Copy): system restore points and backup snapshots preserve
 # file history, including files later permanently deleted (Shift+Delete) or
 # emptied from Recycle Bin. Deep forensic analysis can recover them.
+Write-Host "  [*] Enumerating Volume Shadow Copies..." -ForegroundColor DarkGray
 try {
     $vssCopies = @(Get-CimInstance -ClassName Win32_ShadowCopy -ErrorAction Stop)
     if ($vssCopies.Count -gt 0) {
