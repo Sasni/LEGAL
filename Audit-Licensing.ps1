@@ -76,7 +76,7 @@ function Get-OfficeFriendlyName {
 
     # Map internal SKU tokens in the Name/Description to human-readable product names.
     $skuMap = [ordered]@{
-        'O365BusinessPremium|O365BusinessR|BusinessPremium'          = 'Microsoft 365 Business Premium'
+        'O365BusinessPremium|BusinessPremium'                          = 'Microsoft 365 Business Premium'
         'O365Business(?!Premium)|Office365Business'                  = 'Microsoft 365 Apps for Business'
         'O365ProPlus|O365ProPlusR|MSOfficeProfessionalPlus365'       = 'Microsoft 365 Apps for Enterprise'
         'O365SmallBus'                                               = 'Microsoft 365 Business Basic'
