@@ -1068,13 +1068,12 @@ if ($retailWinLic.Count -gt 0 -and [string]::IsNullOrWhiteSpace($oemKey)) {
     $biosDate = try { (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).ReleaseDate } catch { $null }
     $isLegacySystem = $false
     if ($biosDate) {
-        $biosDt = [DateTime]::ParseExact($biosDate.Substring(0, 8), 'yyyyMMdd', $null)
-        $isLegacySystem = $biosDt -lt (Get-Date '2012-10-26')  # Windows 8 GA date
+        $isLegacySystem = $biosDate -lt (Get-Date '2012-10-26')  # Windows 8 GA date
     }
 
     if ($isLegacySystem) {
         Add-Finding -Id "HWID_RETAIL_NO_OEM_KEY" -Severity "Info" -Area "MAS HWID" `
-            -Evidence "Windows pokazuje kanał Retail i status Licensed, ale nie znaleziono klucza OEM w firmware (tabela MSDM). System pochodzi z ery przed Windows 8 — MSDM nie istniał (BIOS: $biosDate)." `
+            -Evidence "Windows pokazuje kanał Retail i status Licensed, ale nie znaleziono klucza OEM w firmware (tabela MSDM). System pochodzi z ery przed Windows 8 — MSDM nie istniał (BIOS: $($biosDate.ToString('yyyy-MM-dd')))." `
             -Recommendation "To NIE jest anomalia. Maszyny z ery Windows 7 (lub starsze) nie mają tabeli MSDM. Uprawnienie cyfrowe (digital entitlement) jest przechowywane na serwerach Microsoft, nie lokalnie."
     }
     else {
