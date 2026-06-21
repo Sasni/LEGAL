@@ -1081,7 +1081,7 @@ try {
             ID        = 4103, 4104
             StartTime = (Get-Date).AddDays(-90)
         } -MaxEvents 5000 -ErrorAction SilentlyContinue |
-            Where-Object { $_.Message -match $psIndicatorRegex -and $_.ProcessId -ne $PID }
+            Where-Object { $_.Message -match $psIndicatorRegex -and $_.ProcessId -ne $PID -and $_.Message -notmatch 'HWID_GENUINE_TICKET|POWERSHELL_LOG_ACTIVATOR|AMSI_ACTIVATOR_DETECTION|CORR_HWID|SPP_TOKENS_MOD_MID_SESSION' }
 
         foreach ($evt in $psEvents) {
             # Extract a snippet around the match for human-readable evidence
