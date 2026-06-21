@@ -1732,13 +1732,30 @@ Write-Host "    IsSharedComputerActivation: $($office365Signals.IsSharedComputer
 Write-Host ""
 Write-Host "Findings:" -ForegroundColor Yellow
 if ($findings.Count -eq 0) {
-    Write-Host "  No anomalies detected by current checks."
+    Write-Host "  No anomalies detected by current checks." -ForegroundColor Green
 }
 else {
-    foreach ($f in $findings) {
-        Write-Host "  [$($f.Severity)] [$($f.Area)] $($f.Evidence)"
-        Write-Host "     Recommendation: $($f.Recommendation)"
+    $severityColor = @{
+        'Info'     = 'DarkGray'
+        'Low'      = 'Cyan'
+        'Medium'   = 'Yellow'
+        'High'     = 'Magenta'
+        'Critical' = 'Red'
     }
+    $fidx = 0
+    foreach ($f in $findings) {
+        $fidx++
+        $color = $severityColor[$f.Severity]
+        Write-Host ""
+        Write-Host "  [$fidx/$($findings.Count)] " -NoNewline -ForegroundColor DarkGray
+        Write-Host "[$($f.Severity.ToUpper())] " -NoNewline -ForegroundColor $color
+        Write-Host "[$($f.Area)] " -NoNewline -ForegroundColor DarkGray
+        Write-Host $f.Evidence
+        Write-Host "       " -NoNewline
+        Write-Host "-> " -NoNewline -ForegroundColor DarkGray
+        Write-Host $f.Recommendation
+    }
+    Write-Host ""
 }
 
 Write-Host ""
