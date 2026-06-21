@@ -425,7 +425,7 @@ if (-not $office365Identity -or -not $office365Identity.IsOffice365Account) {
             IsOffice365Account  = $true
         }
         Add-Finding -Id "OFFICE365_IDENTITY_PRESENT" -Severity "Info" -Area "Office 365" `
-            -Evidence "User identity detected via $altSource: $altIdentity" `
+            -Evidence "User identity detected via $($altSource): $($altIdentity)" `
             -Recommendation "Correlate with assigned Microsoft 365 license in Entra ID / M365 Admin Center."
     }
 }
