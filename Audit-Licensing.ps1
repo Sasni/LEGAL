@@ -433,6 +433,42 @@ if (-not $office365Identity -or -not $office365Identity.IsOffice365Account) {
         }
     }
 
+    # Check 5: LicenseIdToEmailMapping — direct license-to-email mapping
+    if (-not $altIdentity) {
+        $licMapPath = "HKCU:\Software\Microsoft\Office\16.0\Common\Licensing\LicensingNext\LicenseIdToEmailMapping"
+        if (Test-Path $licMapPath) {
+            try {
+                $mapProps = Get-ItemProperty -Path $licMapPath -ErrorAction Stop
+                foreach ($prop in $mapProps.PSObject.Properties) {
+                    $skip = @('PSPath','PSParentPath','PSChildName','PSDrive','PSProvider')
+                    if ($prop.Name -notin $skip -and $prop.Value -match '@') {
+                        $altIdentity = $prop.Value
+                        $altSource = "LicenseIdToEmailMapping"
+                        break
+                    }
+                }
+            } catch {}
+        }
+    }
+
+    # Check 6: ServicesManagerCache — ConnectionUserUpn
+    if (-not $altIdentity) {
+        $svcCachePath = "HKCU:\Software\Microsoft\Office\16.0\Common\ServicesManagerCache\Identities"
+        if (Test-Path $svcCachePath) {
+            try {
+                $cacheKeys = Get-ChildItem -Path $svcCachePath -Recurse -Depth 2 -ErrorAction SilentlyContinue
+                foreach ($ck in $cacheKeys) {
+                    $cp = Get-ItemProperty -Path $ck.PSPath -ErrorAction SilentlyContinue
+                    if ($cp.ConnectionUserUpn -and $cp.ConnectionUserUpn -match '@') {
+                        $altIdentity = $cp.ConnectionUserUpn
+                        $altSource = "ServicesManagerCache (ConnectionUserUpn)"
+                        break
+                    }
+                }
+            } catch {}
+        }
+    }
+
     if ($altIdentity) {
         $office365Identity = [pscustomobject]@{
             IdentityPath        = $altSource
