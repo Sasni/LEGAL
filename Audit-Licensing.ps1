@@ -482,6 +482,42 @@ if (-not $office365Identity -or -not $office365Identity.IsOffice365Account) {
             DetectedIdentities  = @($altIdentity)
             IsOffice365Account  = $true
         }
+
+        # Enrich with additional profile data from other registry locations
+        $tenantId = ""
+        $userName = ""
+        $userEmail = ""
+
+        # TenantId from ServicesManagerCache
+        if (-not $tenantId) {
+            $tidPath = "HKCU:\Software\Microsoft\Office\16.0\Common\ServicesManagerCache\Identities"
+            if (Test-Path $tidPath) {
+                try {
+                    $tidKeys = Get-ChildItem -Path $tidPath -Recurse -Depth 2 -ErrorAction SilentlyContinue
+                    foreach ($tk in $tidKeys) {
+                        $tp = Get-ItemProperty -Path $tk.PSPath -ErrorAction SilentlyContinue
+                        if ($tp.TenantId) { $tenantId = $tp.TenantId; break }
+                    }
+                } catch {}
+            }
+        }
+
+        # FirstName, LastName, emailAddress from OlsToken
+        $olsPath = "HKCU:\Software\Microsoft\Office\16.0\Common\Licensing\OlsToken\Identity\O365BusinessRetail"
+        if (Test-Path $olsPath) {
+            try {
+                $ols = Get-ItemProperty -Path $olsPath -ErrorAction Stop
+                if ($ols.firstName -and $ols.lastName) {
+                    $userName = "$($ols.firstName) $($ols.lastName)"
+                }
+                if (-not $userEmail -and $ols.emailAddress) { $userEmail = $ols.emailAddress }
+            } catch {}
+        }
+
+        $office365Identity.UserName   = if ($userName) { $userName } else { $office365Identity.UserName }
+        $office365Identity.UserEmail  = if ($userEmail) { $userEmail } else { $office365Identity.UserEmail }
+        $office365Identity.TenantId   = if ($tenantId) { $tenantId } else { $office365Identity.TenantId }
+
         Add-Finding -Id "OFFICE365_IDENTITY_PRESENT" -Severity "Info" -Area "Office 365" `
             -Evidence "User identity detected via $($altSource): $($altIdentity)" `
             -Recommendation "Correlate with assigned Microsoft 365 license in Entra ID / M365 Admin Center."
